@@ -21,10 +21,10 @@ jobs:
         run: python -m py_compile app.py
       - name: Sanity checks
         run: |
-          grep -q 'APP VERSION: 1.1.1' app.py
-          grep -q 'Requirements version: 1.1.1' requirements.txt
-          grep -q 'Repository package version:** 1.1.1' README.md
-          grep -q 'transaction text-layer hardening' README.md
+          grep -Fq 'APP VERSION: 1.1.1' app.py
+          grep -Fq 'Requirements version: 1.1.1' requirements.txt
+          grep -Fq 'Repository package version:** 1.1.1' README.md
+          grep -Fq 'transaction text-layer hardening' README.md
       - name: Commit release and remove temporary files
         run: |
           git config user.name 'github-actions[bot]'
