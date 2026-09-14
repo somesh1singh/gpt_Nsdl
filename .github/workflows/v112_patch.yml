@@ -16,7 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Repair replacement escaping
-        run: sed -i 's/pattern.subn(replacement, text, count=1)/pattern.subn(lambda _m: replacement, text, count=1)/g' .github/v112_patch.py
+        run: |
+          sed -i 's/pattern.subn(replacement, text, count=1)/pattern.subn(lambda _m: replacement, text, count=1)/g' .github/v112_patch.py
       - name: Apply patch
         run: python .github/v112_patch.py
       - name: Syntax check
