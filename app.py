@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.0.7
+# APP VERSION: 1.0.8
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-14"
@@ -780,6 +780,17 @@ def combine_confidence(base: Decimal, issues: list[QualityIssue]) -> Decimal:
 # -----------------------------------------------------------------------------
 
 ISIN_RE = re.compile(r"\bIN[A-Z0-9]{10}\b")
+ISIN_LINE_RE = re.compile(r"^(IN[A-Z0-9]{10})\b\s*(.*)$")
+
+
+def split_isin_line(line: str) -> tuple[str | None, str]:
+    """Return a leading ISIN plus any inline security-description tail."""
+    normalized = " ".join(str(line).split()).strip()
+    match = ISIN_LINE_RE.match(normalized)
+    if not match:
+        return None, ""
+    return match.group(1), match.group(2).strip()
+
 NUMBER_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 DATE_RE = re.compile(r"\b(\d{2}[-/]\d{2}[-/]\d{4})\b")
 
@@ -1381,6 +1392,7 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
       3) Mutual Fund Folio valuation tables with cost + current NAV/value.
 
     Every accepted row is arithmetic-validated before entering analytics.
+    v1.0.8 also accepts rows where ISIN and description share one PDF text line.
     """
     holdings: list[dict[str, Any]] = []
     start_idx = holdings_section_start(lines)
@@ -1415,25 +1427,26 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
                     and strict_numeric_token(token) is None
                 ):
                     back_candidates.append(token)
-            if back_candidates:
+            if back_candidates and back_candidates[-1].upper() not in {"TOTAL", "SUB TOTAL", "GRAND TOTAL"}:
                 current_account = back_candidates[-1]
             elif i + 1 < len(lines):
                 candidate = " ".join(lines[i + 1].split()).strip()
                 if candidate and candidate not in HOLDING_NOISE and "PAN:" not in candidate.upper():
                     current_account = candidate
 
-        if not ISIN_RE.fullmatch(normalized):
+        isin, inline_tail = split_isin_line(normalized)
+        if not isin:
             i += 1
             continue
 
-        isin = normalized
-        chunk: list[str] = []
+        # Some CDSL PDF text layers emit ISIN and security description on one line.
+        chunk: list[str] = [inline_tail] if inline_tail else []
         j = i + 1
 
         while j < len(lines) and len(chunk) < 45:
             token = lines[j].strip()
             norm_token = " ".join(token.split()).strip()
-            if ISIN_RE.fullmatch(norm_token):
+            if split_isin_line(norm_token)[0]:
                 break
             if norm_token in HOLDING_TERMINATORS:
                 break
@@ -3186,6 +3199,8 @@ elif section == "System Status":
             ["NSDL/CDSL/MF-folio holdings parsers", "Implemented", APP_VERSION],
             ["Indian-number parsing (e.g. 36,16,119.95)", "Implemented", APP_VERSION],
             ["Compact cross-CAS reconciliation", "Implemented", APP_VERSION],
+            ["Inline ISIN + security-description row recovery", "Implemented", APP_VERSION],
+            ["ACCOUNT HOLDER context hardening", "Implemented", APP_VERSION],
             ["Holdings arithmetic/reconciliation quality gate", "Implemented", APP_VERSION],
             ["Latest-statement terminal value selection", "Implemented", APP_VERSION],
             ["Automated CAS XIRR", "Implemented starter with parser quality gate", APP_VERSION],

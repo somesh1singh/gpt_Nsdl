@@ -1,6 +1,6 @@
 # NSDL CAS Portfolio Intelligence & Advisory System
 
-**Repository package version:** 1.0.7  
+**Repository package version:** 1.0.8  
 **Blueprint implementation baseline:** 1.0  
 **Target Python:** 3.14  
 **Entrypoint:** `app.py`  
@@ -17,7 +17,7 @@ app.py
 
 It consolidates the earlier multi-file implementation into one Streamlit application so it can be uploaded directly to GitHub and tested on Streamlit Community Cloud.
 
-## What v1.0.7 implements
+## What v1.0.8 implements
 
 The app follows the supplied NSDL CAS Portfolio Intelligence & Advisory System blueprint and includes:
 
@@ -96,7 +96,7 @@ your-repository/
 └── REQUIREMENTS.TXT
 ```
 
-No additional source files are required for v1.0.7.
+No additional source files are required for v1.0.8.
 
 ## Local test
 
@@ -113,7 +113,7 @@ streamlit run app.py
 
 ### CAS parsing
 
-The parser in v1.0.7 is a **defensive heuristic parser**, not yet a guaranteed parser for every historical NSDL CAS layout. It extracts text from PDFs, identifies ISIN-linked lines, attempts to infer quantities and market values, and exposes confidence/warnings instead of silently fabricating data.
+The parser in v1.0.8 is a **defensive heuristic parser**, not yet a guaranteed parser for every historical NSDL CAS layout. It extracts text from PDFs, identifies ISIN-linked lines, attempts to infer quantities and market values, and exposes confidence/warnings instead of silently fabricating data.
 
 For industry-grade use, parser hardening should be performed against several real CAS files spanning different statement formats and years.
 
@@ -144,6 +144,14 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 - added portfolio analytics, tax lots, attribution, benchmarking, scenario and advice modules
 - added graceful handling for incomplete source data
 - added CSV download exports for analysis tables
+
+### v1.0.8 — CDSL reconciliation hardening
+
+- recovers holdings when an ISIN and security description share one PDF-extracted line
+- stops record scanning when the next line starts with another ISIN
+- avoids nearby Total/Sub Total labels replacing the account name
+- retains arithmetic validation and the strict transaction quality gate
+
 
 ## Next version candidates
 
