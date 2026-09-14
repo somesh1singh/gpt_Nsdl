@@ -319,7 +319,7 @@ def transaction_quality_report(tx: pd.DataFrame) -> dict[str, Any]:
     )
     continuity_anomalies = int((continuity > 1.0).sum())
 
-    valid = narrative_hits == 0 and duplicates == 0 and low_confidence == 0
+    valid = narrative_hits == 0 and duplicates == 0 and low_confidence == 0 and continuity_anomalies == 0
     reasons = []
     if narrative_hits:
         reasons.append(f"{narrative_hits} narrative/disclosure row(s)")
@@ -2936,10 +2936,11 @@ elif section == "CAS Parser & Reconciliation":
             qc2.metric("Monetary rows", q["cashflow_rows"])
             qc3.metric("Quantity-only rows", q["quantity_only_rows"])
             qc4.metric("Cashflow coverage", f"{q['cashflow_coverage_pct']:.1f}%")
-            qx1, qx2, qx3 = st.columns(3)
+            qx1, qx2, qx3, qx4 = st.columns(4)
             qx1.metric("External cashflow rows", q.get("external_cashflow_rows", 0))
             qx2.metric("Internal switch/event rows", q.get("internal_transfer_rows", 0))
             qx3.metric("Reversal rows to review", q.get("reversal_review_rows", 0))
+            qx4.metric("Continuity anomalies", q.get("continuity_anomalies", 0))
 
             if not q["valid"]:
                 st.error("Transaction ledger quality gate failed: " + q["reason"])
