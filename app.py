@@ -2352,7 +2352,7 @@ elif section == "CAS Parser & Reconciliation":
             all_holdings = pd.concat(holdings_frames, ignore_index=True)
             st.subheader("Parsed holdings")
             st.caption(
-                "v1.0.6 uses the observed NSDL holdings-table layout and accepts rows only when "
+                "The current parser uses the observed NSDL holdings-table layout and accepts rows only when "
                 "quantity × market price/NAV reconciles to the reported market value."
             )
             st.dataframe(all_holdings, use_container_width=True, hide_index=True)
@@ -2411,7 +2411,7 @@ elif section == "CAS Parser & Reconciliation":
             all_tx = pd.concat(tx_frames, ignore_index=True)
             st.subheader("Inferred transactions")
             st.warning(
-                "Transaction extraction is heuristic in v1.0.4. Review source lines and confidence "
+                "Transaction extraction remains heuristic. Review source lines and confidence "
                 "before relying on automated XIRR or tax analysis."
             )
             st.dataframe(all_tx, use_container_width=True, hide_index=True)
@@ -2459,7 +2459,7 @@ elif section == "CAS Parser & Reconciliation":
 elif section == "XIRR & Benchmarking":
     st.title("XIRR & Benchmarking")
     st.caption(
-        "v1.0.6 uses the latest CAS statement total as terminal value and keeps automated XIRR behind data-quality gates."
+        "The current version uses the latest CAS statement total as terminal value and keeps automated XIRR behind data-quality gates."
     )
 
     auto_tab, manual_tab = st.tabs(["Automated from CAS", "Manual calculator"])
@@ -2482,7 +2482,7 @@ elif section == "XIRR & Benchmarking":
         if not tx.empty and not tx_quality["valid"]:
             st.error(
                 "Automated XIRR quality gate: " + tx_quality["reason"] +
-                ". Re-parse the CAS with v1.0.5 before calculating performance."
+                ". Re-parse the CAS with the current app version before calculating performance."
             )
 
         if tx.empty:
@@ -3172,7 +3172,7 @@ elif section == "System Status":
     st.dataframe(runtime_df, use_container_width=True, hide_index=True)
 
     st.info(
-        "v1.0.1 hotfix: Streamlit Community Cloud requires the main module to end in lowercase `.py`. "
+        "Streamlit Community Cloud requires the main module to end in lowercase `.py`. "
         "The repository now uses `app.py` and `requirements.txt`."
     )
 
