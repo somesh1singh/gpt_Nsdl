@@ -35,6 +35,6 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add app.py README.md requirements.txt
-          git rm .github/v112_patch.py .github/workflows/v112_patch.yml
+          git rm -f .github/v112_patch.py .github/workflows/v112_patch.yml
           git commit -m 'Release v1.1.2 portfolio cashflow semantics hardening'
           git push
