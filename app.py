@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.0.8
+# APP VERSION: 1.0.9
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-14"
@@ -1252,30 +1252,80 @@ def find_value_triplet(chunk: list[str]) -> tuple[list[tuple[int, Decimal]], Dec
 
 def find_cdsl_balance_values(
     chunk: list[str],
-) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
+) -> tuple[Decimal, Decimal, Decimal, Decimal, int] | None:
     """
-    CDSL holding tables expose:
-      Current Bal, Free Bal, Lent, Safekeep, Locked, Pledge..., Market Price, Value.
+    Recover a CDSL balance-table holding from a noisy PDF text chunk.
 
-    The first numeric token is current balance and the last two numeric tokens are
-    market price and market value. The row is accepted only if:
-      Current Balance × Market Price ≈ Market Value.
+    Canonical CDSL rows contain 11 numeric fields:
+      Current Bal, Free Bal, Lent, Safekeep, Locked, Pledge Setup,
+      Pledged, Earmarked, Pledgee, Market Price, Market Value.
+
+    v1.0.8 assumed the first numeric token was Current Bal and the final
+    two numeric tokens were Price/Value. That fails when a security description
+    contains a standalone face-value number (for example "RS. 1/-") or when a
+    PDF page number follows the row. v1.0.9 instead scans for the arithmetic
+    identity Current Balance x Market Price ~= Market Value and strongly prefers
+    the canonical 11-field spacing. The returned index marks the true balance
+    start so description numbers are retained in the security name.
     """
     nums = numeric_tokens_with_index(chunk)
-    if len(nums) < 5:
+    if len(nums) < 3:
         return None
 
-    qty = abs(nums[0][1])
-    market_price = abs(nums[-2][1])
-    market_value = abs(nums[-1][1])
+    candidates: list[
+        tuple[tuple[int, Decimal], Decimal, Decimal, Decimal, Decimal, int]
+    ] = []
 
-    if qty <= 0 or market_price <= 0 or market_value <= 0:
+    # Primary path: exact 11-field CDSL numeric tail. This safely ignores
+    # description numbers before the balance block and page numbers after it.
+    for start in range(0, max(0, len(nums) - 10)):
+        seq = nums[start:start + 11]
+        if len(seq) != 11:
+            continue
+        qty = abs(seq[0][1])
+        market_price = abs(seq[9][1])
+        market_value = abs(seq[10][1])
+        if qty <= 0 or market_price <= 0 or market_value <= 0:
+            continue
+        err = relative_reconciliation_error(qty * market_price, market_value)
+        if err <= Decimal("0.02"):
+            candidates.append(
+                ((0, err), qty, market_price, market_value, err, seq[0][0])
+            )
+
+    # Defensive fallback if one or more zero-balance columns are omitted by the
+    # text layer. Price and value must remain adjacent numeric fields. Prefer
+    # candidate spacing closest to the canonical 9 positions from qty to price.
+    for qpos in range(len(nums)):
+        qty = abs(nums[qpos][1])
+        if qty <= 0:
+            continue
+        for ppos in range(qpos + 2, min(len(nums) - 1, qpos + 12)):
+            market_price = abs(nums[ppos][1])
+            market_value = abs(nums[ppos + 1][1])
+            if market_price <= 0 or market_value <= 0:
+                continue
+            err = relative_reconciliation_error(qty * market_price, market_value)
+            if err > Decimal("0.02"):
+                continue
+            spacing_penalty = abs((ppos - qpos) - 9)
+            candidates.append(
+                (
+                    (spacing_penalty + 1, err),
+                    qty,
+                    market_price,
+                    market_value,
+                    err,
+                    nums[qpos][0],
+                )
+            )
+
+    if not candidates:
         return None
 
-    err = relative_reconciliation_error(qty * market_price, market_value)
-    if err <= Decimal("0.02"):
-        return qty, market_price, market_value, err
-    return None
+    candidates.sort(key=lambda item: item[0])
+    _, qty, market_price, market_value, err, first_balance_idx = candidates[0]
+    return qty, market_price, market_value, err, first_balance_idx
 
 
 def find_mf_folio_values(
@@ -1392,7 +1442,7 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
       3) Mutual Fund Folio valuation tables with cost + current NAV/value.
 
     Every accepted row is arithmetic-validated before entering analytics.
-    v1.0.8 also accepts rows where ISIN and description share one PDF text line.
+    v1.0.9 also recovers CDSL rows contaminated by description numbers or page numbers.
     """
     holdings: list[dict[str, Any]] = []
     start_idx = holdings_section_start(lines)
@@ -1589,11 +1639,10 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
                     }
 
             elif cdsl:
-                qty, market_price, market_value, err = cdsl
+                qty, market_price, market_value, err, first_numeric_idx = cdsl
 
-                # CDSL security description is all text before first numeric balance.
-                nums = numeric_tokens_with_index(chunk)
-                first_numeric_idx = nums[0][0] if nums else len(chunk)
+                # Use the detected balance-block start rather than the first numeric
+                # token, because face-value numbers may occur inside the description.
                 name = " ".join(
                     x for x in chunk[:first_numeric_idx]
                     if strict_numeric_token(x) is None and nsdl_date(x) is None
@@ -1624,10 +1673,8 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
             cdsl = find_cdsl_balance_values(chunk)
             standard = find_value_triplet(chunk)
 
-            if cdsl and len(numeric_tokens_with_index(chunk)) >= 5:
-                qty, nav, market_value, err = cdsl
-                nums = numeric_tokens_with_index(chunk)
-                first_numeric_idx = nums[0][0] if nums else len(chunk)
+            if cdsl:
+                qty, nav, market_value, err, first_numeric_idx = cdsl
                 name = " ".join(
                     x for x in chunk[:first_numeric_idx]
                     if strict_numeric_token(x) is None
@@ -3200,6 +3247,7 @@ elif section == "System Status":
             ["Indian-number parsing (e.g. 36,16,119.95)", "Implemented", APP_VERSION],
             ["Compact cross-CAS reconciliation", "Implemented", APP_VERSION],
             ["Inline ISIN + security-description row recovery", "Implemented", APP_VERSION],
+            ["CDSL numeric-tail/page-number recovery", "Implemented", APP_VERSION],
             ["ACCOUNT HOLDER context hardening", "Implemented", APP_VERSION],
             ["Holdings arithmetic/reconciliation quality gate", "Implemented", APP_VERSION],
             ["Latest-statement terminal value selection", "Implemented", APP_VERSION],

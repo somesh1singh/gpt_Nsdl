@@ -1,6 +1,6 @@
 # NSDL CAS Portfolio Intelligence & Advisory System
 
-**Repository package version:** 1.0.8  
+**Repository package version:** 1.0.9  
 **Blueprint implementation baseline:** 1.0  
 **Target Python:** 3.14  
 **Entrypoint:** `app.py`  
@@ -17,7 +17,7 @@ app.py
 
 It consolidates the earlier multi-file implementation into one Streamlit application so it can be uploaded directly to GitHub and tested on Streamlit Community Cloud.
 
-## What v1.0.8 implements
+## What v1.0.9 implements
 
 The app follows the supplied NSDL CAS Portfolio Intelligence & Advisory System blueprint and includes:
 
@@ -96,7 +96,7 @@ your-repository/
 └── requirements.txt
 ```
 
-No additional source files are required for v1.0.8.
+No additional source files are required for v1.0.9.
 
 ## Local test
 
@@ -113,7 +113,7 @@ streamlit run app.py
 
 ### CAS parsing
 
-The parser in v1.0.8 is a **defensive heuristic parser**, not yet a guaranteed parser for every historical NSDL CAS layout. It extracts text from PDFs, identifies ISIN-linked lines, attempts to infer quantities and market values, and exposes confidence/warnings instead of silently fabricating data.
+The parser in v1.0.9 is a **defensive heuristic parser**, not yet a guaranteed parser for every historical NSDL CAS layout. It extracts text from PDFs, identifies ISIN-linked lines, attempts to infer quantities and market values, and exposes confidence/warnings instead of silently fabricating data.
 
 For industry-grade use, parser hardening should be performed against several real CAS files spanning different statement formats and years.
 
@@ -151,6 +151,16 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 - stops record scanning when the next line starts with another ISIN
 - avoids nearby Total/Sub Total labels replacing the account name
 - retains arithmetic validation and the strict transaction quality gate
+
+
+### v1.0.9 — CDSL numeric-tail and page-break hardening
+
+- replaces the brittle first-number/last-two-number CDSL assumption with arithmetic candidate scanning
+- prefers the canonical 11 numeric CDSL balance fields and validates `quantity × price ≈ value`
+- ignores security-description face-value numbers when locating the true holding quantity
+- ignores trailing PDF page-number contamination after a CDSL holding row
+- carries the detected balance-start index into equity and demat-MF name extraction
+- targets the v1.0.8 omissions seen in Oriental Aromatics, Amara Raja and page-end demat-MF rows while retaining the strict reconciliation gate
 
 
 ## Next version candidates
