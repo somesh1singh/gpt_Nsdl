@@ -1,6 +1,6 @@
 # NSDL CAS Portfolio Intelligence & Advisory System
 
-**Repository package version:** 1.0.6  
+**Repository package version:** 1.0.7  
 **Blueprint implementation baseline:** 1.0  
 **Target Python:** 3.14  
 **Entrypoint:** `app.py`  
@@ -17,7 +17,7 @@ app.py
 
 It consolidates the earlier multi-file implementation into one Streamlit application so it can be uploaded directly to GitHub and tested on Streamlit Community Cloud.
 
-## What v1.0.6 implements
+## What v1.0.7 implements
 
 The app follows the supplied NSDL CAS Portfolio Intelligence & Advisory System blueprint and includes:
 
@@ -96,7 +96,7 @@ your-repository/
 └── REQUIREMENTS.TXT
 ```
 
-No additional source files are required for v1.0.6.
+No additional source files are required for v1.0.7.
 
 ## Local test
 
@@ -113,7 +113,7 @@ streamlit run app.py
 
 ### CAS parsing
 
-The parser in v1.0.6 is a **defensive heuristic parser**, not yet a guaranteed parser for every historical NSDL CAS layout. It extracts text from PDFs, identifies ISIN-linked lines, attempts to infer quantities and market values, and exposes confidence/warnings instead of silently fabricating data.
+The parser in v1.0.7 is a **defensive heuristic parser**, not yet a guaranteed parser for every historical NSDL CAS layout. It extracts text from PDFs, identifies ISIN-linked lines, attempts to infer quantities and market values, and exposes confidence/warnings instead of silently fabricating data.
 
 For industry-grade use, parser hardening should be performed against several real CAS files spanning different statement formats and years.
 
@@ -133,7 +133,7 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 
 ## Version history
 
-### v1.0.6 — 2026-09-14
+### v1.0.7 — 2026-09-14
 
 - converted the earlier multi-file backend implementation into a single Streamlit app
 - changed deployment target to Python 3.14
@@ -161,7 +161,7 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 - richer goal planning and staged rebalancing
 
 
-### v1.0.6 — Streamlit filename hotfix
+### v1.0.7 — Streamlit filename hotfix
 
 - Renamed `APP.PY` → `app.py` because Streamlit requires a lowercase `.py` extension.
 - Renamed `REQUIREMENTS.TXT` → `requirements.txt` so Streamlit Community Cloud reliably detects dependencies.
@@ -169,7 +169,7 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 - No analytical logic removed.
 
 
-### v1.0.6 — Password-protected CAS PDF support
+### v1.0.7 — Password-protected CAS PDF support
 
 - Added support for encrypted/password-protected PDF statements.
 - After a PDF is uploaded, the CAS Parser page asks for a password for each uploaded PDF.
@@ -179,7 +179,7 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 - If a password is missing or incorrect, the app now shows a specific message instead of a generic parsing failure.
 
 
-### v1.0.6 — Institutional path + India-date fixes
+### v1.0.7 — Institutional path + India-date fixes
 
 - Corrected the upstream universe path to `shareholding_history/data/_universe.csv`.
 - Added the separate upstream `symbol_renames.json` mapping.
@@ -188,7 +188,7 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 - Preserved Python 3.14 target and password-protected PDF support.
 
 
-### v1.0.6 — Automated CAS XIRR & benchmark reconstruction
+### v1.0.7 — Automated CAS XIRR & benchmark reconstruction
 
 - Added stateful heuristic transaction extraction from CAS PDFs.
 - CAS Parser now displays and exports inferred transaction rows with source lines and confidence.
@@ -203,7 +203,7 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 - No claim is made that generic transaction parsing is fully validated; statement-specific hardening remains required.
 
 
-### v1.0.6 — Transaction parser false-positive fix
+### v1.0.7 — Transaction parser false-positive fix
 
 This version was created after reviewing an exported `cas_inferred_transactions.csv`
 where the parser incorrectly treated an **Exit Load** disclosure sentence as a SELL transaction.
@@ -222,7 +222,7 @@ Fixes:
 - Manual XIRR remains available as fallback.
 
 
-### v1.0.6 — NSDL holdings-layout parser hardening
+### v1.0.7 — NSDL holdings-layout parser hardening
 
 This version was built from the actual extracted August-2026 NSDL CAS layout supplied for testing.
 
@@ -241,3 +241,32 @@ Key changes:
 - Fixed terminal value logic: only the **latest CAS** is used. Monthly CAS values are no longer added together.
 - When available, terminal value uses NSDL's exact `YOUR CONSOLIDATED PORTFOLIO VALUE`.
 - Automated XIRR remains unavailable when no genuine dated transaction rows are reconstructed.
+
+
+### v1.0.7 — Full holdings/reconciliation correction
+
+Built from the v1.0.6 exports plus the observed NSDL/CDSL and Mutual Fund Folio layouts.
+
+Key corrections:
+
+- Indian-number parser now accepts values such as `1,10,967.50`, `1,36,980.00`,
+  `17,88,268.86` and `36,16,119.95`.
+- Added CDSL balance-table parser for Zerodha holdings:
+  `Current Balance ... Market Price ... Value`.
+- Added Mutual Fund Folio parser that distinguishes:
+  `Units → Average Cost → Total Cost → Current NAV → Current Value → Unrealised P/L`.
+  The parser now uses **Current NAV and Current Value**, not historical cost.
+- `Mutual Fund Folios (F)` is treated as its own asset class and account.
+- Added robust account-name detection for both NSDL and CDSL table orderings.
+- Added NSDL portfolio-composition asset-class reconciliation.
+- Fixed the cross-CAS reconciliation Cartesian-product bug that previously expanded
+  a small holding set into hundreds of thousands of meaningless rows.
+- Cross-CAS output is now compact and ISIN-based.
+- Existing password-PDF support, India-date handling, transaction quality gate,
+  institutional intelligence and latest-CAS terminal-value rules are retained.
+
+Acceptance target for this revision:
+- each uploaded CAS should reconcile its parsed Equity / Demat MF / SGB / MF Folio
+  market values to the NSDL statement totals within a small tolerance;
+- cross-CAS reconciliation should contain one meaningful row per security rather
+  than a Cartesian product.

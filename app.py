@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.0.6
+# APP VERSION: 1.0.7
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-14"
@@ -956,7 +956,13 @@ def infer_transaction_numbers(line: str, date_token: str) -> tuple[Decimal | Non
 
 
 STRICT_NUM_RE = re.compile(
-    r"^(?:(?:\d{1,3}(?:,\d{3})+)|(?:\d+))(?:\.\d+)?$"
+    # Plain numbers, western grouping (1,000,000), and Indian grouping
+    # (1,00,000 / 36,16,119.95). Optional leading sign is supported.
+    r"^[+-]?(?:"
+    r"\d+(?:\.\d+)?"
+    r"|\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+    r"|\d{1,3}(?:,\d{2})*,\d{3}(?:\.\d+)?"
+    r")$"
 )
 SYMBOL_RE = re.compile(r"^[A-Z0-9&._+\-]+(?:\.NSE|\.BSE)$", re.IGNORECASE)
 
@@ -1033,6 +1039,57 @@ def extract_consolidated_portfolio_value(text: str) -> Decimal | None:
     return D(m.group(1)) if m else None
 
 
+ASSET_COMPOSITION_LABELS = {
+    "Equity": "Equities (E)",
+    "Mutual Fund (Demat)": "Mutual Funds (M)",
+    "SGB": "Sovereign Gold Bonds (SGB)",
+    "Mutual Fund Folio": "Mutual Fund Folios (F)",
+}
+
+
+def extract_asset_composition(text: str) -> dict[str, Decimal]:
+    """Read NSDL's own portfolio-composition totals for reconciliation."""
+    out: dict[str, Decimal] = {}
+    for asset_type, label in ASSET_COMPOSITION_LABELS.items():
+        pattern = re.escape(label) + r"\\s+([\\d,]+\\.\\d{2})"
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            out[asset_type] = D(m.group(1))
+    return out
+
+
+def asset_reconciliation_rows(
+    holdings: pd.DataFrame,
+    expected: dict[str, Decimal],
+) -> list[dict[str, Any]]:
+    rows = []
+    for asset_type, expected_value in expected.items():
+        if holdings is None or holdings.empty or "asset_type" not in holdings.columns:
+            parsed = Decimal("0")
+        else:
+            sub = holdings[holdings["asset_type"] == asset_type]
+            parsed = sum(
+                (D(x) for x in sub.get("market_value_inferred", pd.Series(dtype=float)).dropna()),
+                Decimal("0"),
+            )
+        diff = parsed - expected_value
+        pct = (
+            abs(diff) / expected_value * Decimal("100")
+            if expected_value != 0 else Decimal("0")
+        )
+        rows.append(
+            {
+                "asset_type": asset_type,
+                "statement_value": float(expected_value),
+                "parsed_value": float(parsed),
+                "difference": float(diff),
+                "difference_pct": float(pct),
+                "status": "PASS" if pct <= Decimal("0.50") else "REVIEW",
+            }
+        )
+    return rows
+
+
 def holdings_section_start(lines: list[str]) -> int:
     for i, line in enumerate(lines[:-1]):
         if line.strip().lower() == "holdings":
@@ -1047,16 +1104,57 @@ def holdings_section_start(lines: list[str]) -> int:
 
 
 def holding_asset_state(line: str) -> str | None:
-    normalized = " ".join(line.split())
-    if normalized == "Equities (E)":
+    normalized = " ".join(line.split()).strip()
+    low = normalized.lower()
+
+    if low.startswith("equities") and "(e)" in low:
         return "EQUITY"
-    if normalized == "Mutual Funds (M)":
+    if low.startswith("mutual funds") and "(m)" in low:
         return "MF_DEMAT"
-    if normalized == "Sovereign Gold Bonds (SGB)":
+    if low.startswith("sovereign gold bonds") or "(sgb)" in low:
         return "SGB"
-    if normalized == "Mutual Fund Folios":
+    if low.startswith("mutual fund folios"):
         return "MF_FOLIO"
     return None
+
+
+def detect_account_name(lines: list[str], index: int, current: str | None) -> str | None:
+    """
+    NSDL and CDSL layouts place ACCOUNT HOLDER / broker name in different orders.
+    This helper handles both:
+      NSDL Demat Account -> ICICI BANK LIMITED -> ACCOUNT HOLDER
+      NSDL Demat Account -> ACCOUNT HOLDER -> ICICI BANK LIMITED
+    """
+    line = " ".join(lines[index].split()).strip()
+
+    if line not in {"NSDL Demat Account", "CDSL Demat Account"}:
+        return current
+
+    candidates = []
+    for j in range(index + 1, min(len(lines), index + 6)):
+        token = " ".join(lines[j].split()).strip()
+        if not token:
+            continue
+        if token in {
+            "ACCOUNT HOLDER", "Equities (E)", "Mutual Funds (M)",
+            "Sovereign Gold Bonds (SGB)", "Mutual Fund Folios (F)",
+        }:
+            continue
+        if token.startswith("DP ID") or token.startswith("Client ID"):
+            continue
+        if "PAN:" in token.upper():
+            continue
+        if token.startswith("Consolidated Account Statement"):
+            continue
+        if token.startswith("National Securities Depository Limited"):
+            continue
+        # Account names are normally textual and often contain LIMITED / SECURITIES / BANK.
+        if not ISIN_RE.search(token) and strict_numeric_token(token) is None:
+            candidates.append(token)
+
+    if candidates:
+        return candidates[0]
+    return current
 
 
 def holding_noise_line(line: str) -> bool:
@@ -1141,6 +1239,90 @@ def find_value_triplet(chunk: list[str]) -> tuple[list[tuple[int, Decimal]], Dec
     return best
 
 
+def find_cdsl_balance_values(
+    chunk: list[str],
+) -> tuple[Decimal, Decimal, Decimal, Decimal] | None:
+    """
+    CDSL holding tables expose:
+      Current Bal, Free Bal, Lent, Safekeep, Locked, Pledge..., Market Price, Value.
+
+    The first numeric token is current balance and the last two numeric tokens are
+    market price and market value. The row is accepted only if:
+      Current Balance × Market Price ≈ Market Value.
+    """
+    nums = numeric_tokens_with_index(chunk)
+    if len(nums) < 5:
+        return None
+
+    qty = abs(nums[0][1])
+    market_price = abs(nums[-2][1])
+    market_value = abs(nums[-1][1])
+
+    if qty <= 0 or market_price <= 0 or market_value <= 0:
+        return None
+
+    err = relative_reconciliation_error(qty * market_price, market_value)
+    if err <= Decimal("0.02"):
+        return qty, market_price, market_value, err
+    return None
+
+
+def find_mf_folio_values(
+    chunk: list[str],
+) -> dict[str, Decimal] | None:
+    """
+    Mutual Fund Folio table layout:
+      ... Folio No, Units, Average Cost/Unit, Total Cost,
+          Current NAV, Current Value, Unrealised Profit/(Loss)
+
+    Folio number may itself be numeric, so valuation is identified from the six
+    right-most numeric fields and validated using both cost and current-value
+    arithmetic.
+    """
+    nums = numeric_tokens_with_index(chunk)
+    if len(nums) < 6:
+        return None
+
+    # Search from the right because folio numbers/UCCs can also be numeric.
+    for end in range(len(nums), 5, -1):
+        seq = nums[end - 6:end]
+        qty, avg_cost, total_cost, current_nav, current_value, unrealised = [
+            x[1] for x in seq
+        ]
+
+        qty = abs(qty)
+        avg_cost = abs(avg_cost)
+        total_cost = abs(total_cost)
+        current_nav = abs(current_nav)
+        current_value = abs(current_value)
+
+        if min(qty, avg_cost, total_cost, current_nav, current_value) <= 0:
+            continue
+
+        cost_err = relative_reconciliation_error(qty * avg_cost, total_cost)
+        value_err = relative_reconciliation_error(qty * current_nav, current_value)
+        pnl_err = relative_reconciliation_error(
+            current_value - total_cost,
+            unrealised,
+        ) if unrealised != 0 else Decimal("0")
+
+        if cost_err <= Decimal("0.03") and value_err <= Decimal("0.03"):
+            return {
+                "quantity": qty,
+                "average_cost": avg_cost,
+                "total_cost": total_cost,
+                "current_nav": current_nav,
+                "current_value": current_value,
+                "unrealised_pl": unrealised,
+                "cost_error": cost_err,
+                "value_error": value_err,
+                "pnl_error": pnl_err,
+                "first_numeric_index": seq[0][0],
+            }
+
+    return None
+
+
 def find_sgb_values(
     chunk: list[str],
 ) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal] | None:
@@ -1193,15 +1375,12 @@ def clean_record_chunk(chunk: list[str]) -> list[str]:
 
 def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str, Any]]:
     """
-    Parse the observed NSDL CAS holdings layout.
+    Parse NSDL CAS holdings across three observed layouts:
+      1) NSDL demat equity / demat MF vertical tables.
+      2) CDSL balance tables (e.g. Zerodha), with many balance columns.
+      3) Mutual Fund Folio valuation tables with cost + current NAV/value.
 
-    The supplied August-2026 layout is vertically extracted as:
-      Equity: ISIN, symbol, company, face value, shares, price, value
-      Demat MF: ISIN, description, units, NAV, value
-      SGB: ISIN, issuer/series, coupon, maturity, units, face value,
-           market price, value
-
-    The parser validates monetary arithmetic before accepting a row.
+    Every accepted row is arithmetic-validated before entering analytics.
     """
     holdings: list[dict[str, Any]] = []
     start_idx = holdings_section_start(lines)
@@ -1211,34 +1390,57 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
     i = start_idx
     while i < len(lines):
         line = lines[i].strip()
+        normalized = " ".join(line.split()).strip()
 
-        state = holding_asset_state(line)
+        # Account context may appear before or after ACCOUNT HOLDER.
+        current_account = detect_account_name(lines, i, current_account)
+
+        state = holding_asset_state(normalized)
         if state:
             current_asset = state
             if state == "MF_FOLIO":
                 current_account = "Mutual Fund Folios"
 
-        if line == "ACCOUNT HOLDER" and i + 1 < len(lines):
-            candidate = lines[i + 1].strip()
-            if candidate and candidate not in HOLDING_NOISE:
-                current_account = candidate
+        if normalized == "ACCOUNT HOLDER":
+            # Look both backward and forward for account name.
+            back_candidates = []
+            for k in range(max(start_idx, i - 3), i):
+                token = " ".join(lines[k].split()).strip()
+                if (
+                    token
+                    and token not in HOLDING_NOISE
+                    and token not in {"NSDL Demat Account", "CDSL Demat Account"}
+                    and not token.startswith("DP ID")
+                    and "PAN:" not in token.upper()
+                    and strict_numeric_token(token) is None
+                ):
+                    back_candidates.append(token)
+            if back_candidates:
+                current_account = back_candidates[-1]
+            elif i + 1 < len(lines):
+                candidate = " ".join(lines[i + 1].split()).strip()
+                if candidate and candidate not in HOLDING_NOISE and "PAN:" not in candidate.upper():
+                    current_account = candidate
 
-        if not ISIN_RE.fullmatch(line):
+        if not ISIN_RE.fullmatch(normalized):
             i += 1
             continue
 
-        isin = line
+        isin = normalized
         chunk: list[str] = []
         j = i + 1
 
-        while j < len(lines) and len(chunk) < 30:
+        while j < len(lines) and len(chunk) < 45:
             token = lines[j].strip()
-            if ISIN_RE.fullmatch(token):
+            norm_token = " ".join(token.split()).strip()
+            if ISIN_RE.fullmatch(norm_token):
                 break
-            if token in HOLDING_TERMINATORS:
+            if norm_token in HOLDING_TERMINATORS:
                 break
-            # A new asset heading means this record is over.
-            if holding_asset_state(token):
+            if holding_asset_state(norm_token):
+                break
+            # Stop parsing holdings when transactions section begins.
+            if norm_token.lower().startswith("transactions for the period"):
                 break
             chunk.append(token)
             j += 1
@@ -1246,7 +1448,6 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
         chunk = clean_record_chunk(chunk)
         asset = current_asset
 
-        # Infer asset class from ISIN / symbol if section state is unavailable.
         symbol_candidate = next((x for x in chunk if SYMBOL_RE.fullmatch(x)), None)
         if asset is None:
             if isin.startswith("INF"):
@@ -1258,75 +1459,52 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
 
         row: dict[str, Any] | None = None
 
-        if asset == "EQUITY" or symbol_candidate:
-            match = find_equity_quad(chunk)
-            if match:
-                seq, err = match
-                face, qty, market_price, market_value = [x[1] for x in seq]
-                first_numeric_idx = seq[0][0]
+        # -----------------------------------------------------------------
+        # Mutual Fund Folios: use current NAV/current value, not total cost.
+        # -----------------------------------------------------------------
+        if asset == "MF_FOLIO":
+            folio = find_mf_folio_values(chunk)
+            if folio:
+                first_numeric_idx = int(folio["first_numeric_index"])
+                prefix = chunk[:first_numeric_idx]
 
-                symbol = symbol_candidate
-                symbol_idx = chunk.index(symbol) if symbol in chunk else -1
-                name_candidates = [
-                    x for idx, x in enumerate(chunk[:first_numeric_idx])
-                    if idx != symbol_idx
-                    and strict_numeric_token(x) is None
-                    and nsdl_date(x) is None
-                ]
-                name = " ".join(name_candidates).strip()
-
-                if name and name.upper() != "ISIN":
-                    row = {
-                        "file": filename,
-                        "account": current_account,
-                        "asset_type": "Equity",
-                        "isin": isin,
-                        "symbol": symbol,
-                        "name": name,
-                        "face_value": float(face),
-                        "quantity_inferred": float(qty),
-                        "market_price_inferred": float(market_price),
-                        "market_value_inferred": float(market_value),
-                        "reconciliation_error_pct": float(err * Decimal("100")),
-                        "line_confidence": 0.99 if err <= Decimal("0.001") else 0.95,
-                        "source_block": " | ".join(chunk[:14]),
-                    }
-
-        elif asset in {"MF_DEMAT", "MF_FOLIO"} or isin.startswith("INF"):
-            match = find_value_triplet(chunk)
-            if match:
-                seq, err = match
-                qty, nav, market_value = [x[1] for x in seq]
-                first_numeric_idx = seq[0][0]
-
-                description_parts = [
-                    x for x in chunk[:first_numeric_idx]
+                # UCC typically immediately follows ISIN; scheme name follows UCC.
+                # Folio number is numeric and therefore excluded from name text.
+                textual = [
+                    x for x in prefix
                     if strict_numeric_token(x) is None
                     and nsdl_date(x) is None
-                    and not x.lower().startswith("folio")
+                    and x.upper() not in {"NOT AVAILABLE", "0"}
                 ]
-                name = " ".join(description_parts).strip()
+                if textual and re.fullmatch(r"[A-Z0-9/_-]{4,}", textual[0] or ""):
+                    textual = textual[1:]
+                name = " ".join(textual).strip()
 
-                if name and name.upper() != "ISIN":
+                if name:
                     row = {
                         "file": filename,
-                        "account": current_account,
-                        "asset_type": (
-                            "Mutual Fund Folio" if asset == "MF_FOLIO"
-                            else "Mutual Fund (Demat)"
-                        ),
+                        "account": "Mutual Fund Folios",
+                        "asset_type": "Mutual Fund Folio",
                         "isin": isin,
                         "symbol": None,
                         "name": name,
                         "face_value": None,
-                        "quantity_inferred": float(qty),
-                        "market_price_inferred": float(nav),
-                        "market_value_inferred": float(market_value),
-                        "reconciliation_error_pct": float(err * Decimal("100")),
-                        "line_confidence": 0.98 if err <= Decimal("0.002") else 0.94,
-                        "source_block": " | ".join(chunk[:14]),
+                        "quantity_inferred": float(folio["quantity"]),
+                        "average_cost_inferred": float(folio["average_cost"]),
+                        "total_cost_inferred": float(folio["total_cost"]),
+                        "market_price_inferred": float(folio["current_nav"]),
+                        "market_value_inferred": float(folio["current_value"]),
+                        "unrealised_pl_inferred": float(folio["unrealised_pl"]),
+                        "reconciliation_error_pct": float(
+                            folio["value_error"] * Decimal("100")
+                        ),
+                        "line_confidence": 0.99,
+                        "source_block": " | ".join(chunk[:24]),
                     }
 
+        # -----------------------------------------------------------------
+        # Sovereign Gold Bonds
+        # -----------------------------------------------------------------
         elif asset == "SGB" or isin.startswith("IN00"):
             values = find_sgb_values(chunk)
             if values:
@@ -1354,16 +1532,148 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
                     "market_price_inferred": float(market_price),
                     "market_value_inferred": float(market_value),
                     "reconciliation_error_pct": float(err * Decimal("100")),
-                    "line_confidence": 0.98 if err <= Decimal("0.002") else 0.94,
-                    "source_block": " | ".join(chunk[:16]),
+                    "line_confidence": 0.99 if err <= Decimal("0.002") else 0.95,
+                    "source_block": " | ".join(chunk[:18]),
                 }
+
+        # -----------------------------------------------------------------
+        # Equity. First try NSDL 4-column row; then CDSL balance-table row.
+        # -----------------------------------------------------------------
+        elif asset == "EQUITY" or symbol_candidate:
+            standard = find_equity_quad(chunk)
+            cdsl = find_cdsl_balance_values(chunk)
+
+            if standard:
+                seq, err = standard
+                face, qty, market_price, market_value = [x[1] for x in seq]
+                first_numeric_idx = seq[0][0]
+
+                symbol = symbol_candidate
+                symbol_idx = chunk.index(symbol) if symbol in chunk else -1
+                name_candidates = [
+                    x for idx, x in enumerate(chunk[:first_numeric_idx])
+                    if idx != symbol_idx
+                    and strict_numeric_token(x) is None
+                    and nsdl_date(x) is None
+                ]
+                name = " ".join(name_candidates).strip()
+
+                if name and name.upper() != "ISIN":
+                    row = {
+                        "file": filename,
+                        "account": current_account,
+                        "asset_type": "Equity",
+                        "isin": isin,
+                        "symbol": symbol,
+                        "name": name,
+                        "face_value": float(face),
+                        "quantity_inferred": float(qty),
+                        "market_price_inferred": float(market_price),
+                        "market_value_inferred": float(market_value),
+                        "reconciliation_error_pct": float(err * Decimal("100")),
+                        "line_confidence": 0.99 if err <= Decimal("0.001") else 0.95,
+                        "source_block": " | ".join(chunk[:18]),
+                    }
+
+            elif cdsl:
+                qty, market_price, market_value, err = cdsl
+
+                # CDSL security description is all text before first numeric balance.
+                nums = numeric_tokens_with_index(chunk)
+                first_numeric_idx = nums[0][0] if nums else len(chunk)
+                name = " ".join(
+                    x for x in chunk[:first_numeric_idx]
+                    if strict_numeric_token(x) is None and nsdl_date(x) is None
+                ).strip()
+
+                if name:
+                    row = {
+                        "file": filename,
+                        "account": current_account,
+                        "asset_type": "Equity",
+                        "isin": isin,
+                        "symbol": None,
+                        "name": name,
+                        "face_value": None,
+                        "quantity_inferred": float(qty),
+                        "market_price_inferred": float(market_price),
+                        "market_value_inferred": float(market_value),
+                        "reconciliation_error_pct": float(err * Decimal("100")),
+                        "line_confidence": 0.98 if err <= Decimal("0.002") else 0.94,
+                        "source_block": " | ".join(chunk[:24]),
+                    }
+
+        # -----------------------------------------------------------------
+        # Demat Mutual Funds. CDSL balance tables are common for Zerodha;
+        # NSDL demat MF uses Units/NAV/Value triplet.
+        # -----------------------------------------------------------------
+        elif asset == "MF_DEMAT" or isin.startswith("INF"):
+            cdsl = find_cdsl_balance_values(chunk)
+            standard = find_value_triplet(chunk)
+
+            if cdsl and len(numeric_tokens_with_index(chunk)) >= 5:
+                qty, nav, market_value, err = cdsl
+                nums = numeric_tokens_with_index(chunk)
+                first_numeric_idx = nums[0][0] if nums else len(chunk)
+                name = " ".join(
+                    x for x in chunk[:first_numeric_idx]
+                    if strict_numeric_token(x) is None
+                    and nsdl_date(x) is None
+                    and x.upper() not in {"NOT AVAILABLE"}
+                ).strip()
+
+                if name:
+                    row = {
+                        "file": filename,
+                        "account": current_account,
+                        "asset_type": "Mutual Fund (Demat)",
+                        "isin": isin,
+                        "symbol": None,
+                        "name": name,
+                        "face_value": None,
+                        "quantity_inferred": float(qty),
+                        "market_price_inferred": float(nav),
+                        "market_value_inferred": float(market_value),
+                        "reconciliation_error_pct": float(err * Decimal("100")),
+                        "line_confidence": 0.98 if err <= Decimal("0.002") else 0.94,
+                        "source_block": " | ".join(chunk[:24]),
+                    }
+
+            elif standard:
+                seq, err = standard
+                qty, nav, market_value = [x[1] for x in seq]
+                first_numeric_idx = seq[0][0]
+                description_parts = [
+                    x for x in chunk[:first_numeric_idx]
+                    if strict_numeric_token(x) is None
+                    and nsdl_date(x) is None
+                    and not x.lower().startswith("folio")
+                ]
+                name = " ".join(description_parts).strip()
+
+                if name and name.upper() != "ISIN":
+                    row = {
+                        "file": filename,
+                        "account": current_account,
+                        "asset_type": "Mutual Fund (Demat)",
+                        "isin": isin,
+                        "symbol": None,
+                        "name": name,
+                        "face_value": None,
+                        "quantity_inferred": float(qty),
+                        "market_price_inferred": float(nav),
+                        "market_value_inferred": float(market_value),
+                        "reconciliation_error_pct": float(err * Decimal("100")),
+                        "line_confidence": 0.98 if err <= Decimal("0.002") else 0.94,
+                        "source_block": " | ".join(chunk[:18]),
+                    }
 
         if row is not None:
             holdings.append(row)
 
         i += 1
 
-    # Exact duplicate rows may appear because of PDF text-layer duplication.
+    # Exact duplicate rows may appear because PDF text layers repeat headers/records.
     if holdings:
         deduped = []
         seen = set()
@@ -1372,7 +1682,6 @@ def parse_nsdl_holdings_layout(lines: list[str], filename: str) -> list[dict[str
                 row.get("account"),
                 row.get("asset_type"),
                 row.get("isin"),
-                row.get("symbol"),
                 row.get("quantity_inferred"),
                 row.get("market_price_inferred"),
                 row.get("market_value_inferred"),
@@ -1481,6 +1790,11 @@ def parse_cas_pdf(
     holdings_as_of = extract_holdings_as_of(text)
     statement_total = extract_consolidated_portfolio_value(text)
     holdings_quality = holding_quality_report(holdings_df, statement_total)
+    asset_composition = extract_asset_composition(text)
+    asset_reconciliation = asset_reconciliation_rows(
+        holdings_df,
+        asset_composition,
+    )
 
     # Use parsed holdings names to preserve security context while scanning
     # transaction sections later in the statement.
@@ -1585,6 +1899,10 @@ def parse_cas_pdf(
             None if statement_total is None else float(statement_total)
         ),
         "parse_confidence": float(confidence),
+        "asset_composition": {
+            k: float(v) for k, v in asset_composition.items()
+        },
+        "asset_reconciliation": asset_reconciliation,
         "holdings_quality": {
             **holdings_quality,
             "parsed_value": float(holdings_quality["parsed_value"]),
@@ -1893,8 +2211,8 @@ if section == "Home":
     st.subheader("Blueprint coverage")
     coverage = pd.DataFrame(
         [
-            ["CAS ingestion / parsing", "Implemented starter", "NSDL layout-aware holdings parser + transaction quality gates"],
-            ["Multi-CAS reconstruction", "Partial", "Validated holdings snapshots; transaction reconstruction still under hardening"],
+            ["CAS ingestion / parsing", "Implemented starter", "NSDL + CDSL + MF-folio holdings parser with arithmetic validation"],
+            ["Multi-CAS reconstruction", "Partial", "Compact ISIN-based reconciliation; transaction reconstruction still under hardening"],
             ["Securities master / renames", "Partial", "Upload/fetch universe data; no persistent DB"],
             ["XIRR", "Implemented", "Manual + automated CAS reconstructed cash-flow engine"],
             ["Tax lots", "Implemented starter", "FIFO/LIFO; configurable rates"],
@@ -1997,6 +2315,26 @@ elif section == "CAS Parser & Reconciliation":
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
         df_download("Download statement summary", summary_df, "cas_statement_summary.csv", "cas_sum")
 
+        asset_rows = []
+        for r in st.session_state.cas_results:
+            for item in r.get("asset_reconciliation", []):
+                asset_rows.append({"file": r["filename"], **item})
+
+        if asset_rows:
+            asset_rec_df = pd.DataFrame(asset_rows)
+            st.subheader("Asset-class reconciliation")
+            st.caption(
+                "Parsed holdings are compared directly with NSDL's own portfolio-composition "
+                "totals. A PASS means the asset-class value is within 0.5%."
+            )
+            st.dataframe(asset_rec_df, use_container_width=True, hide_index=True)
+            df_download(
+                "Download asset-class reconciliation",
+                asset_rec_df,
+                "cas_asset_reconciliation.csv",
+                "cas_asset_rec",
+            )
+
         if holdings_frames:
             all_holdings = pd.concat(holdings_frames, ignore_index=True)
             st.subheader("Parsed holdings")
@@ -2009,19 +2347,45 @@ elif section == "CAS Parser & Reconciliation":
 
             if len(st.session_state.cas_results) >= 2:
                 st.subheader("Cross-CAS quantity comparison")
-                pivot_index = [
-                    c for c in ["asset_type", "isin", "symbol", "name"]
-                    if c in all_holdings.columns
-                ]
-                pivot = (
-                    all_holdings.pivot_table(
-                        index=pivot_index,
-                        columns="file",
-                        values="quantity_inferred",
-                        aggfunc="sum",
-                        dropna=False,
+                # Compact reconciliation: one genuine security row per asset_type + ISIN.
+                # Do NOT pivot on symbol/name simultaneously with dropna=False because pandas can
+                # create a Cartesian product of all symbols × names × ISINs.
+                compact = (
+                    all_holdings
+                    .groupby(["file", "asset_type", "isin"], as_index=False, dropna=False)
+                    .agg(
+                        symbol=("symbol", lambda s: next(
+                            (str(x) for x in s if pd.notna(x) and str(x).strip()),
+                            ""
+                        )),
+                        name=("name", lambda s: next(
+                            (str(x) for x in s if pd.notna(x) and str(x).strip()),
+                            ""
+                        )),
+                        quantity=("quantity_inferred", "sum"),
+                        market_value=("market_value_inferred", "sum"),
                     )
-                    .reset_index()
+                )
+
+                metadata = (
+                    compact.sort_values("file")
+                    .groupby(["asset_type", "isin"], as_index=False)
+                    .agg(
+                        symbol=("symbol", lambda s: next((x for x in s if x), "")),
+                        name=("name", lambda s: next((x for x in s if x), "")),
+                    )
+                )
+
+                qty_pivot = compact.pivot(
+                    index=["asset_type", "isin"],
+                    columns="file",
+                    values="quantity",
+                ).reset_index()
+
+                pivot = metadata.merge(
+                    qty_pivot,
+                    on=["asset_type", "isin"],
+                    how="left",
                 )
                 st.dataframe(pivot, use_container_width=True, hide_index=True)
                 df_download("Download reconciliation view", pivot, "cas_reconciliation.csv", "cas_rec")
@@ -2819,7 +3183,9 @@ elif section == "System Status":
             ["Institutional PIT overlay", "Implemented when data supplied", APP_VERSION],
             ["Index/F&O history", "Implemented when data supplied", APP_VERSION],
             ["Advice impact estimator", "Implemented starter", APP_VERSION],
-            ["NSDL layout-aware holdings parser", "Implemented", APP_VERSION],
+            ["NSDL/CDSL/MF-folio holdings parsers", "Implemented", APP_VERSION],
+            ["Indian-number parsing (e.g. 36,16,119.95)", "Implemented", APP_VERSION],
+            ["Compact cross-CAS reconciliation", "Implemented", APP_VERSION],
             ["Holdings arithmetic/reconciliation quality gate", "Implemented", APP_VERSION],
             ["Latest-statement terminal value selection", "Implemented", APP_VERSION],
             ["Automated CAS XIRR", "Implemented starter with parser quality gate", APP_VERSION],
