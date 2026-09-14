@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.0
+# APP VERSION: 1.1.1
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-14"
@@ -1127,44 +1127,109 @@ def parse_cas_transactions_layout(
     """
     Structured NSDL CAS transaction reconstruction.
 
-    Two materially different CAS transaction layouts are handled separately:
-      1. MF Folio rows contain investor consideration, stamp duty, NAV/price and units.
-      2. Depository (CDSL/NSDL) rows contain only quantity movement and balance; they
-         do not contain trade consideration, so no cash flow is fabricated.
+    v1.1.1 hardens transaction recovery for the PDF text-layer layout actually
+    emitted by NSDL CAS. Transaction table cells may be extracted either as one
+    logical line or as several consecutive lines (date, particulars, quantity,
+    balance / amount, NAV, units). We therefore assemble a bounded logical row
+    beginning at each dated token before interpreting it.
 
-    Opening/closing balances are reconciliation context, not investor transactions.
+    Two materially different CAS transaction layouts remain separated:
+      1. MF Folio rows contain investor consideration, stamp duty, NAV/price and units.
+      2. Depository (CDSL/NSDL) rows contain quantity movement and balance only;
+         no trade consideration is fabricated.
     """
     holding_name_map = holding_name_map or {}
     rows: list[dict[str, Any]] = []
     current_isin: str | None = None
     current_name: str | None = None
     current_folio: str | None = None
-    current_context = "UNKNOWN"
     last_balance: dict[str, Decimal] = {}
     opening_balance_nonzero = 0
     opening_balance_rows = 0
     malformed_monetary_rows = 0
+    in_transaction_section = False
+    transactions_marker_pending = False
+
+    def normalized_line(idx: int) -> str:
+        return " ".join(raw_lines[idx].split()).strip()
+
+    def isin_from_position(idx: int) -> tuple[str | None, str | None, int]:
+        """Return ISIN, description, and number of consumed physical lines."""
+        line = normalized_line(idx)
+        isin, desc = transaction_isin_header(line)
+        if isin:
+            return isin, desc, 1
+
+        low = line.lower().replace(" ", "")
+        if low in {"isin:", "isin"} and idx + 1 < len(raw_lines):
+            nxt = normalized_line(idx + 1)
+            m = re.match(r"^(IN[A-Z0-9]{10})\b\s*(?:[-–—]\s*)?(.*)$", nxt, re.IGNORECASE)
+            if m:
+                return m.group(1).upper(), m.group(2).strip(" -–—") or None, 2
+
+        if in_transaction_section:
+            m = re.match(r"^(IN[A-Z0-9]{10})\b\s*(?:[-–—]\s*)?(.*)$", line, re.IGNORECASE)
+            if m:
+                return m.group(1).upper(), m.group(2).strip(" -–—") or None, 1
+        return None, None, 0
+
+    def is_section_boundary(line: str) -> bool:
+        ll = line.lower()
+        return (
+            "transactions for the period" in ll
+            or "transaction statement for the period" in ll
+            or ll.startswith("summary of transactions of")
+            or ll.startswith("date transaction particulars")
+            or ll.startswith("date transaction details")
+        )
+
+    def collect_dated_block(start: int) -> tuple[str, int]:
+        """Join split PDF table cells belonging to one dated transaction row."""
+        parts = [normalized_line(start)]
+        j = start + 1
+        while j < len(raw_lines) and j <= start + 16:
+            nxt = normalized_line(j)
+            if not nxt:
+                j += 1
+                continue
+            next_date, _ = date_at_row_start(nxt)
+            next_isin, _, _ = isin_from_position(j)
+            low = nxt.lower()
+            if (next_date is not None or next_isin or low.startswith("folio no")
+                    or "opening balance" in low or "closing balance" in low
+                    or is_section_boundary(nxt)):
+                break
+            if _transaction_noise_line(nxt) or "***end of statement***" in low:
+                j += 1
+                continue
+            if low.startswith("know more about your accounts"):
+                break
+            parts.append(nxt)
+            j += 1
+        return " ".join(parts), j
 
     i = 0
     while i < len(raw_lines):
-        line = " ".join(raw_lines[i].split()).strip()
+        line = normalized_line(i)
         low = line.lower()
 
-        if "mutual fund folios" in low and ("(f)" in low or current_context != "MF_FOLIO"):
-            current_context = "MF_FOLIO"
-        elif "cdsl demat account" in low:
-            current_context = "DEPOSITORY"
-        elif "nsdl demat account" in low:
-            current_context = "DEPOSITORY"
-        elif "mutual funds transaction statement" in low:
-            current_context = "DEPOSITORY"
+        if "transactions for the period" in low or "transaction statement for the period" in low:
+            in_transaction_section = True
+            transactions_marker_pending = False
+        elif transactions_marker_pending and low.startswith("for the period"):
+            in_transaction_section = True
+            transactions_marker_pending = False
+        elif low == "transactions":
+            transactions_marker_pending = True
+        elif transactions_marker_pending and low not in {"", "transactions"}:
+            transactions_marker_pending = False
 
-        isin, header_name = transaction_isin_header(line)
+        isin, header_name, consumed = isin_from_position(i)
         if isin:
             current_isin = isin
             current_name = holding_name_map.get(isin) or header_name or isin
             current_folio = None
-            i += 1
+            i += consumed
             continue
 
         if low.startswith("folio no"):
@@ -1172,33 +1237,62 @@ def parse_cas_transactions_layout(
             i += 1
             continue
 
-        if current_isin:
-            opening = _balance_line(line, "opening balance")
+        # MF-folio opening/closing balances are often undated. Their numeric value
+        # can also be extracted on the following physical line.
+        if current_isin and ("opening balance" in low or "closing balance" in low):
+            bal_kind = "opening balance" if "opening balance" in low else "closing balance"
+            bal_block = line
+            j = i + 1
+            while j < len(raw_lines) and j <= i + 3:
+                nxt = normalized_line(j)
+                if not nxt:
+                    j += 1
+                    continue
+                if date_at_row_start(nxt)[0] is not None or isin_from_position(j)[0] or nxt.lower().startswith("folio no"):
+                    break
+                if _transaction_noise_line(nxt):
+                    j += 1
+                    continue
+                bal_block += " " + nxt
+                break
+            bal = _balance_line(bal_block, bal_kind)
+            if bal is not None:
+                last_balance[current_isin] = bal
+                if bal_kind == "opening balance":
+                    opening_balance_rows += 1
+                    if bal > 0:
+                        opening_balance_nonzero += 1
+            i = max(i + 1, j + 1 if j < len(raw_lines) and bal_block != line else i + 1)
+            continue
+
+        txn_date, _ = date_at_row_start(line)
+        if txn_date is None or not current_isin or not in_transaction_section:
+            i += 1
+            continue
+
+        block, next_i = collect_dated_block(i)
+        block_low = block.lower()
+
+        if "opening balance" in block_low:
+            opening = _balance_line(block, "opening balance")
             if opening is not None:
                 last_balance[current_isin] = opening
                 opening_balance_rows += 1
                 if opening > 0:
                     opening_balance_nonzero += 1
-                i += 1
-                continue
-
-            closing = _balance_line(line, "closing balance")
+            i = max(i + 1, next_i)
+            continue
+        if "closing balance" in block_low:
+            closing = _balance_line(block, "closing balance")
             if closing is not None:
                 last_balance[current_isin] = closing
-                i += 1
-                continue
-
-        txn_date, date_token = date_at_row_start(line)
-        if txn_date is None or not current_isin:
-            i += 1
+            i = max(i + 1, next_i)
             continue
 
-        # Depository quantity movement. The right-most two numbers are movement
-        # quantity and current balance; settlement IDs/counters before them are ignored.
-        is_credit = bool(DEPOSITORY_CREDIT_RE.search(line))
-        is_debit = bool(DEPOSITORY_DEBIT_RE.search(line))
+        is_credit = bool(DEPOSITORY_CREDIT_RE.search(block))
+        is_debit = bool(DEPOSITORY_DEBIT_RE.search(block))
         if is_credit or is_debit:
-            vals = transaction_numeric_values(line)
+            vals = transaction_numeric_values(block)
             if len(vals) >= 2:
                 quantity = vals[-2]
                 balance = vals[-1]
@@ -1226,33 +1320,15 @@ def parse_cas_transactions_layout(
                     "balance_after_inferred": float(balance),
                     "balance_reconciliation_error_pct": None if bal_err is None else float(bal_err * Decimal("100")),
                     "transaction_confidence": float(confidence),
-                    "source_line": line[:700],
+                    "source_line": block[:700],
                 })
                 last_balance[current_isin] = balance
-            i += 1
+            i = max(i + 1, next_i)
             continue
 
-        # MF-folio monetary transaction may wrap over several PDF text lines.
-        txn_type = classify_transaction_line(line)
-        if txn_type and not is_narrative_non_transaction(line):
-            block_parts = [line]
-            parsed_tail = _mf_monetary_tail(line)
-            j = i + 1
-            while parsed_tail is None and j < len(raw_lines) and j <= i + 10:
-                nxt = " ".join(raw_lines[j].split()).strip()
-                next_isin, _ = transaction_isin_header(nxt)
-                next_date, _ = date_at_row_start(nxt)
-                next_low = nxt.lower()
-                if next_isin or next_date is not None or "opening balance" in next_low or "closing balance" in next_low:
-                    break
-                if next_low.startswith("know more about your accounts") or "***end of statement***" in next_low:
-                    break
-                if not _transaction_noise_line(nxt):
-                    block_parts.append(nxt)
-                    parsed_tail = _mf_monetary_tail(" ".join(block_parts))
-                j += 1
-
-            block = " ".join(block_parts)
+        txn_type = classify_transaction_line(block)
+        if txn_type and not is_narrative_non_transaction(block):
+            parsed_tail = _mf_monetary_tail(block)
             if parsed_tail is not None:
                 amount = parsed_tail["amount"]
                 sign = transaction_cashflow_sign(txn_type)
@@ -1278,15 +1354,11 @@ def parse_cas_transactions_layout(
                     "transaction_confidence": 0.99,
                     "source_line": block[:700],
                 })
-                i = max(i + 1, j)
-                continue
             else:
                 malformed_monetary_rows += 1
 
-        i += 1
+        i = max(i + 1, next_i)
 
-    # Deduplicate exact PDF text-layer repeats without collapsing legitimate same-day
-    # transactions that differ in amount/quantity/source block.
     deduped: list[dict[str, Any]] = []
     seen = set()
     for row in rows:

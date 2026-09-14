@@ -1,6 +1,6 @@
 # NSDL CAS Portfolio Intelligence & Advisory System
 
-**Repository package version:** 1.1.0
+**Repository package version:** 1.1.1
 **Blueprint implementation baseline:** 1.0
 **Target Python:** 3.14
 **Entrypoint:** `app.py`
@@ -17,7 +17,7 @@ app.py
 
 It consolidates the earlier multi-file implementation into one Streamlit application so it can be uploaded directly to GitHub and tested on Streamlit Community Cloud.
 
-## What v1.1.0 implements
+## What v1.1.1 implements
 
 The app follows the supplied NSDL CAS Portfolio Intelligence & Advisory System blueprint and includes:
 
@@ -49,6 +49,15 @@ The app follows the supplied NSDL CAS Portfolio Intelligence & Advisory System b
 - scenario/stress projection
 - downloadable analysis tables
 - implementation/status page inside the app
+
+### v1.1.1 — transaction text-layer hardening
+
+- assembles dated transaction rows when PDF table cells are split across physical text lines
+- handles split `ISIN :` labels and bare ISIN transaction headers inside validated transaction sections
+- recovers undated MF-folio opening/closing balances used for history-completeness diagnostics
+- keeps depository quantity-only movements separate from MF-folio monetary cash flows
+- preserves the rule that missing trade consideration is never fabricated
+
 
 ## Data-source model
 
