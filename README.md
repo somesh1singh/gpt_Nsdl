@@ -91,9 +91,9 @@ If you later need to change the Python runtime, Streamlit Community Cloud requir
 
 ```text
 your-repository/
-├── APP.PY
-├── README.MD
-└── REQUIREMENTS.TXT
+├── app.py
+├── README.md
+└── requirements.txt
 ```
 
 No additional source files are required for v1.0.8.
@@ -105,7 +105,7 @@ With Python 3.14:
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r REQUIREMENTS.TXT
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
@@ -137,7 +137,7 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 
 - converted the earlier multi-file backend implementation into a single Streamlit app
 - changed deployment target to Python 3.14
-- preserved only `README.MD`, `requirements.txt`, and `app.py`
+- preserved only `README.md`, `requirements.txt`, and `app.py`
 - added in-app version display
 - added dependency/version diagnostics
 - added institutional intelligence upload/fetch workflow
