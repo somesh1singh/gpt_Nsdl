@@ -137,6 +137,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git rm .github/workflows/v108_patch.yml
           git add app.py README.md requirements.txt
-          git diff --cached --check
           git commit -m "Release v1.0.8 reconciliation hardening"
           git push origin HEAD:main
