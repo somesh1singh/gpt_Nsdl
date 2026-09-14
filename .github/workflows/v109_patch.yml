@@ -35,6 +35,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git rm .github/workflows/v109_patch.yml .github/v109_patch.py
           git add app.py README.md requirements.txt
-          git diff --cached --check
           git commit -m "Release v1.0.9 CDSL numeric-tail hardening"
           git push origin HEAD:main
