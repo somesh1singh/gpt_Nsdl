@@ -1,6 +1,6 @@
 # NSDL CAS Portfolio Intelligence & Advisory System
 
-**Repository package version:** 1.1.1
+**Repository package version:** 1.1.2
 **Blueprint implementation baseline:** 1.0
 **Target Python:** 3.14
 **Entrypoint:** `app.py`
@@ -17,7 +17,7 @@ app.py
 
 It consolidates the earlier multi-file implementation into one Streamlit application so it can be uploaded directly to GitHub and tested on Streamlit Community Cloud.
 
-## What v1.1.1 implements
+## What v1.1.2 implements
 
 The app follows the supplied NSDL CAS Portfolio Intelligence & Advisory System blueprint and includes:
 
@@ -190,6 +190,16 @@ Do not deploy sensitive personal CAS statements to a public/shared app unless yo
 - blocks full-portfolio automated XIRR when CAS monetary consideration is incomplete instead of mixing partial MF cashflows with whole-portfolio terminal value
 - keeps manual XIRR available and identifies broker tradebook/ledger as the required source for missing depository consideration
 - retains the v1.0.10 historical-SGB fallback and all v1.0.9 CDSL holdings fixes
+
+
+### v1.1.2 — portfolio cashflow semantics hardening
+
+- distinguishes external investor cashflows from internal mutual-fund switches
+- classifies reversal rows separately and excludes them from portfolio XIRR pending corroboration
+- includes separately printed stamp duty in external purchase outflows
+- preserves scheme-level switch direction while setting portfolio-level switch cashflow to zero
+- adds external/internal/reversal counts to the transaction-quality view
+- flags material depository quantity-continuity anomalies for review
 
 
 ## Next version candidates

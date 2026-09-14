@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.1
+# APP VERSION: 1.1.2
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-14"
@@ -271,6 +271,10 @@ def transaction_quality_report(tx: pd.DataFrame) -> dict[str, Any]:
             "low_confidence": 0,
             "narrative_hits": 0,
             "cashflow_rows": 0,
+            "external_cashflow_rows": 0,
+            "internal_transfer_rows": 0,
+            "reversal_review_rows": 0,
+            "continuity_anomalies": 0,
             "quantity_only_rows": 0,
             "cashflow_coverage_pct": 0.0,
             "automated_xirr_ready": False,
@@ -287,7 +291,7 @@ def transaction_quality_report(tx: pd.DataFrame) -> dict[str, Any]:
     duplicate_subset = [
         c for c in [
             "isin", "folio", "txn_date", "txn_type", "quantity_inferred",
-            "amount_inferred", "cashflow_inferred", "source_line"
+            "amount_inferred", "source_line"
         ]
         if c in tx.columns
     ]
@@ -301,12 +305,19 @@ def transaction_quality_report(tx: pd.DataFrame) -> dict[str, Any]:
 
     source_kind = tx.get("transaction_source", pd.Series([""] * len(tx))).fillna("").astype(str)
     quantity_only_rows = int((source_kind == "DEPOSITORY_QUANTITY_ONLY").sum())
-    cashflow = pd.to_numeric(
-        tx.get("cashflow_inferred", pd.Series([None] * len(tx))),
+    monetary_rows = int((source_kind == "MF_FOLIO_MONETARY").sum())
+    cashflow_coverage_pct = float(monetary_rows / len(tx) * 100) if len(tx) else 0.0
+
+    scope = tx.get("cashflow_scope", pd.Series([""] * len(tx))).fillna("").astype(str)
+    external_cashflow_rows = int((scope == "EXTERNAL").sum())
+    internal_transfer_rows = int((scope == "INTERNAL").sum())
+    reversal_review_rows = int((scope == "REVIEW").sum())
+
+    continuity = pd.to_numeric(
+        tx.get("balance_reconciliation_error_pct", pd.Series([None] * len(tx))),
         errors="coerce",
     )
-    cashflow_rows = int(cashflow.notna().sum())
-    cashflow_coverage_pct = float(cashflow_rows / len(tx) * 100) if len(tx) else 0.0
+    continuity_anomalies = int((continuity > 1.0).sum())
 
     valid = narrative_hits == 0 and duplicates == 0 and low_confidence == 0
     reasons = []
@@ -316,11 +327,17 @@ def transaction_quality_report(tx: pd.DataFrame) -> dict[str, Any]:
         reasons.append(f"{duplicates} duplicate row(s)")
     if low_confidence:
         reasons.append(f"{low_confidence} low-confidence row(s)")
+    if continuity_anomalies:
+        reasons.append(f"{continuity_anomalies} quantity-continuity anomaly row(s) flagged for review")
 
-    # CAS depository rows can validate quantity movements but do not disclose trade
-    # consideration. Mixing partial MF cashflows with the whole-portfolio terminal
-    # value would manufacture a misleading XIRR, so full automation remains blocked.
-    automated_xirr_ready = valid and quantity_only_rows == 0 and cashflow_rows > 0
+    # CAS depository rows validate quantity movements but omit trade consideration.
+    # Full-portfolio XIRR additionally requires no unresolved reversal rows.
+    automated_xirr_ready = (
+        valid
+        and quantity_only_rows == 0
+        and reversal_review_rows == 0
+        and external_cashflow_rows > 0
+    )
 
     return {
         "valid": valid,
@@ -329,7 +346,11 @@ def transaction_quality_report(tx: pd.DataFrame) -> dict[str, Any]:
         "duplicates": duplicates,
         "low_confidence": low_confidence,
         "narrative_hits": narrative_hits,
-        "cashflow_rows": cashflow_rows,
+        "cashflow_rows": monetary_rows,
+        "external_cashflow_rows": external_cashflow_rows,
+        "internal_transfer_rows": internal_transfer_rows,
+        "reversal_review_rows": reversal_review_rows,
+        "continuity_anomalies": continuity_anomalies,
         "quantity_only_rows": quantity_only_rows,
         "cashflow_coverage_pct": cashflow_coverage_pct,
         "automated_xirr_ready": automated_xirr_ready,
@@ -386,24 +407,34 @@ def reconstructed_portfolio_cashflows(
     tx = reconstructed_cas_transactions()
     terminal_value = reconstructed_terminal_value()
 
-    if tx.empty or "cashflow_inferred" not in tx.columns:
+    if tx.empty:
         return [], tx, terminal_value
 
-    clean = tx.dropna(subset=["txn_date", "cashflow_inferred"]).copy()
+    flow_col = (
+        "portfolio_cashflow_inferred"
+        if "portfolio_cashflow_inferred" in tx.columns
+        else "cashflow_inferred"
+    )
+    if flow_col not in tx.columns:
+        return [], tx, terminal_value
+
+    clean = tx.dropna(subset=["txn_date", flow_col]).copy()
+    if "cashflow_scope" in clean.columns:
+        clean = clean[clean["cashflow_scope"].eq("EXTERNAL")].copy()
+    else:
+        clean = clean[pd.to_numeric(clean[flow_col], errors="coerce").fillna(0).ne(0)].copy()
     if clean.empty:
         return [], clean, terminal_value
 
     grouped = (
-        clean.groupby("txn_date", as_index=False)["cashflow_inferred"]
+        clean.groupby("txn_date", as_index=False)[flow_col]
         .sum()
         .sort_values("txn_date")
     )
-    cashflows = [(d, D(v)) for d, v in zip(grouped["txn_date"], grouped["cashflow_inferred"])]
+    cashflows = [(d, D(v)) for d, v in zip(grouped["txn_date"], grouped[flow_col])]
 
     if terminal_date is None:
-        terminal_date = max(
-            [d for d, _ in cashflows] + [india_today()]
-        )
+        terminal_date = max([d for d, _ in cashflows] + [india_today()])
 
     if terminal_value > 0:
         cashflows.append((terminal_date, terminal_value))
@@ -984,6 +1015,15 @@ def classify_transaction_line(line: str) -> str | None:
     if is_narrative_non_transaction(line):
         return None
 
+    # Portfolio-XIRR semantics require internal switches and reversals to be
+    # distinguished from genuine external purchases/redemptions.
+    if "reversal" in ll:
+        return "REVERSAL"
+    if re.search(r"\bswitch\s*-?\s*in\b", ll):
+        return "SWITCH_IN"
+    if re.search(r"\bswitch\s*-?\s*out\b", ll):
+        return "SWITCH_OUT"
+
     # More specific phrases must be checked before broader ones.
     for txn_type in ["DIV_REINVEST", "SELL", "BUY", "DIVIDEND", "BONUS", "RIGHTS"]:
         for kw in TRANSACTION_KEYWORDS[txn_type]:
@@ -993,11 +1033,11 @@ def classify_transaction_line(line: str) -> str | None:
 
 
 def transaction_cashflow_sign(txn_type: str) -> int:
-    # Only external investor cash flows belong in XIRR. Dividend reinvestment and
-    # bonus allotments are internal/non-cash events and therefore have zero sign.
-    if txn_type in {"BUY", "RIGHTS"}:
+    # Scheme-level direction. Whole-portfolio XIRR uses the separately stored
+    # portfolio_cashflow_inferred field so internal switches are not counted.
+    if txn_type in {"BUY", "RIGHTS", "SWITCH_IN"}:
         return -1
-    if txn_type in {"SELL", "DIVIDEND"}:
+    if txn_type in {"SELL", "DIVIDEND", "SWITCH_OUT"}:
         return 1
     return 0
 
@@ -1127,7 +1167,7 @@ def parse_cas_transactions_layout(
     """
     Structured NSDL CAS transaction reconstruction.
 
-    v1.1.1 hardens transaction recovery for the PDF text-layer layout actually
+    v1.1.2 hardens transaction recovery for the PDF text-layer layout actually
     emitted by NSDL CAS. Transaction table cells may be extracted either as one
     logical line or as several consecutive lines (date, particulars, quantity,
     balance / amount, NAV, units). We therefore assemble a bounded logical row
@@ -1315,6 +1355,8 @@ def parse_cas_transactions_layout(
                     "nav_inferred": None,
                     "price_inferred": None,
                     "cashflow_inferred": None,
+                    "portfolio_cashflow_inferred": None,
+                    "cashflow_scope": "UNAVAILABLE_IN_CAS",
                     "cashflow_status": "UNAVAILABLE_IN_CAS",
                     "transaction_source": "DEPOSITORY_QUANTITY_ONLY",
                     "balance_after_inferred": float(balance),
@@ -1331,9 +1373,36 @@ def parse_cas_transactions_layout(
             parsed_tail = _mf_monetary_tail(block)
             if parsed_tail is not None:
                 amount = parsed_tail["amount"]
+                stamp = parsed_tail["stamp_duty"]
                 sign = transaction_cashflow_sign(txn_type)
-                cashflow = amount * Decimal(sign) if sign else Decimal("0")
-                cashflow_status = "AVAILABLE" if sign else "NON_EXTERNAL_EVENT"
+                scheme_cashflow = amount * Decimal(sign) if sign else Decimal("0")
+
+                # Whole-portfolio XIRR must contain only money crossing the investor /
+                # portfolio boundary. Switches are internal transfers. Reversal rows are
+                # retained for audit but are not promoted to external cashflows without
+                # corroborating bank/broker evidence. Purchase stamp duty is included in
+                # the external outflow because the statement prints it separately.
+                if txn_type == "REVERSAL":
+                    portfolio_cashflow = None
+                    cashflow_scope = "REVIEW"
+                    cashflow_status = "REVERSAL_REVIEW"
+                elif txn_type in {"SWITCH_IN", "SWITCH_OUT"}:
+                    portfolio_cashflow = Decimal("0")
+                    cashflow_scope = "INTERNAL"
+                    cashflow_status = "INTERNAL_TRANSFER"
+                elif sign < 0:
+                    portfolio_cashflow = -(amount + stamp)
+                    cashflow_scope = "EXTERNAL"
+                    cashflow_status = "AVAILABLE_EXTERNAL"
+                elif sign > 0:
+                    portfolio_cashflow = amount
+                    cashflow_scope = "EXTERNAL"
+                    cashflow_status = "AVAILABLE_EXTERNAL"
+                else:
+                    portfolio_cashflow = Decimal("0")
+                    cashflow_scope = "INTERNAL"
+                    cashflow_status = "NON_EXTERNAL_EVENT"
+
                 rows.append({
                     "file": filename,
                     "isin": current_isin,
@@ -1343,10 +1412,12 @@ def parse_cas_transactions_layout(
                     "txn_type": txn_type,
                     "quantity_inferred": float(parsed_tail["units"]),
                     "amount_inferred": float(amount),
-                    "stamp_duty_inferred": float(parsed_tail["stamp_duty"]),
+                    "stamp_duty_inferred": float(stamp),
                     "nav_inferred": float(parsed_tail["nav"]),
                     "price_inferred": float(parsed_tail["price"]),
-                    "cashflow_inferred": float(cashflow),
+                    "cashflow_inferred": float(scheme_cashflow),
+                    "portfolio_cashflow_inferred": None if portfolio_cashflow is None else float(portfolio_cashflow),
+                    "cashflow_scope": cashflow_scope,
                     "cashflow_status": cashflow_status,
                     "transaction_source": "MF_FOLIO_MONETARY",
                     "balance_after_inferred": None,
@@ -2853,7 +2924,7 @@ elif section == "CAS Parser & Reconciliation":
             all_tx = pd.concat(tx_frames, ignore_index=True)
             st.subheader("Structured CAS transaction ledger")
             st.info(
-                "v1.1.0 parses MF-folio monetary transactions separately from depository "
+                "v1.1.2 separates external investor cashflows, internal switches, reversals, and depository "
                 "quantity movements. Depository CAS rows do not disclose trade consideration; "
                 "those rows are preserved but never converted into invented cashflows."
             )
@@ -2865,6 +2936,10 @@ elif section == "CAS Parser & Reconciliation":
             qc2.metric("Monetary rows", q["cashflow_rows"])
             qc3.metric("Quantity-only rows", q["quantity_only_rows"])
             qc4.metric("Cashflow coverage", f"{q['cashflow_coverage_pct']:.1f}%")
+            qx1, qx2, qx3 = st.columns(3)
+            qx1.metric("External cashflow rows", q.get("external_cashflow_rows", 0))
+            qx2.metric("Internal switch/event rows", q.get("internal_transfer_rows", 0))
+            qx3.metric("Reversal rows to review", q.get("reversal_review_rows", 0))
 
             if not q["valid"]:
                 st.error("Transaction ledger quality gate failed: " + q["reason"])
