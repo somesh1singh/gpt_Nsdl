@@ -24,188 +24,111 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          app_path = Path('app.py')
-          text = app_path.read_text()
-
+          p = Path('app.py')
+          text = p.read_text()
           text = text.replace('# APP VERSION: 1.0.7', '# APP VERSION: 1.0.8')
           text = text.replace('APP_VERSION = "1.0.7"', 'APP_VERSION = "1.0.8"')
 
-          old = 'ISIN_RE = re.compile(r"\\bIN[A-Z0-9]{10}\\b")\n'
-          helper = '''ISIN_RE = re.compile(r"\\bIN[A-Z0-9]{10}\\b")
-          ISIN_LINE_RE = re.compile(r"^(IN[A-Z0-9]{10})\\b\\s*(.*)$")
-
-
-          def split_isin_line(line: str) -> tuple[str | None, str]:
-              """
-              Return an ISIN when it starts a PDF-extracted line plus any inline tail.
-
-              Some NSDL/CDSL text layers keep the ISIN on its own line, while others
-              emit ``ISIN SECURITY DESCRIPTION`` on a single line. Requiring a full
-              line match silently skipped valid holdings, especially in CDSL tables.
-              """
-              normalized = " ".join(str(line).split()).strip()
-              match = ISIN_LINE_RE.match(normalized)
-              if not match:
-                  return None, ""
-              return match.group(1), match.group(2).strip()
-
-          '''
+          anchor = 'ISIN_RE = re.compile(r"\\bIN[A-Z0-9]{10}\\b")\n'
+          helper = (
+              'ISIN_RE = re.compile(r"\\bIN[A-Z0-9]{10}\\b")\n'
+              'ISIN_LINE_RE = re.compile(r"^(IN[A-Z0-9]{10})\\b\\s*(.*)$")\n\n\n'
+              'def split_isin_line(line: str) -> tuple[str | None, str]:\n'
+              '    """Return a leading ISIN plus any inline security-description tail."""\n'
+              '    normalized = " ".join(str(line).split()).strip()\n'
+              '    match = ISIN_LINE_RE.match(normalized)\n'
+              '    if not match:\n'
+              '        return None, ""\n'
+              '    return match.group(1), match.group(2).strip()\n\n'
+          )
           if 'def split_isin_line' not in text:
-              if old not in text:
-                  raise SystemExit('ISIN_RE anchor not found')
-              text = text.replace(old, helper, 1)
+              if anchor not in text:
+                  raise SystemExit('ISIN anchor not found')
+              text = text.replace(anchor, helper, 1)
 
-          old_block = '''        if normalized == "ACCOUNT HOLDER":
-              # Look both backward and forward for account name.
-              back_candidates = []
-              for k in range(max(start_idx, i - 3), i):
-                  token = " ".join(lines[k].split()).strip()
-                  if (
-                      token
-                      and token not in HOLDING_NOISE
-                      and token not in {"NSDL Demat Account", "CDSL Demat Account"}
-                      and not token.startswith("DP ID")
-                      and "PAN:" not in token.upper()
-                      and strict_numeric_token(token) is None
-                  ):
-                      back_candidates.append(token)
-              if back_candidates:
-                  current_account = back_candidates[-1]
-              elif i + 1 < len(lines):
-                  candidate = " ".join(lines[i + 1].split()).strip()
-                  if candidate and candidate not in HOLDING_NOISE and "PAN:" not in candidate.upper():
-                      current_account = candidate
-
-          if not ISIN_RE.fullmatch(normalized):
-              i += 1
-              continue
-
-          isin = normalized
-          chunk: list[str] = []
-          j = i + 1
-
-          while j < len(lines) and len(chunk) < 45:
-              token = lines[j].strip()
-              norm_token = " ".join(token.split()).strip()
-              if ISIN_RE.fullmatch(norm_token):
-                  break
-          '''
-
-          new_block = '''        if normalized == "ACCOUNT HOLDER":
-              # Prefer the forward token. In several CAS layouts a preceding
-              # "Total"/"Sub Total" is close enough to be mistaken for a broker.
-              forward_candidate = None
-              for k in range(i + 1, min(len(lines), i + 4)):
-                  candidate = " ".join(lines[k].split()).strip()
-                  if (
-                      candidate
-                      and candidate not in HOLDING_NOISE
-                      and candidate not in {"NSDL Demat Account", "CDSL Demat Account"}
-                      and not candidate.startswith("DP ID")
-                      and not candidate.startswith("Client ID")
-                      and "PAN:" not in candidate.upper()
-                      and strict_numeric_token(candidate) is None
-                      and split_isin_line(candidate)[0] is None
-                  ):
-                      forward_candidate = candidate
-                      break
-
-              back_candidates = []
-              for k in range(max(start_idx, i - 3), i):
-                  token = " ".join(lines[k].split()).strip()
-                  if (
-                      token
-                      and token not in HOLDING_NOISE
-                      and token not in {"NSDL Demat Account", "CDSL Demat Account"}
-                      and token.upper() not in {"TOTAL", "SUB TOTAL", "GRAND TOTAL"}
-                      and not token.startswith("DP ID")
-                      and not token.startswith("Client ID")
-                      and "PAN:" not in token.upper()
-                      and strict_numeric_token(token) is None
-                      and split_isin_line(token)[0] is None
-                  ):
-                      back_candidates.append(token)
-
-              if forward_candidate:
-                  current_account = forward_candidate
-              elif back_candidates:
-                  current_account = back_candidates[-1]
-
-          isin, inline_tail = split_isin_line(normalized)
-          if not isin:
-              i += 1
-              continue
-
-          # Preserve security/scheme description text that the PDF extractor may
-          # keep on the same physical line as the ISIN.
-          chunk: list[str] = [inline_tail] if inline_tail else []
-          j = i + 1
-
-          while j < len(lines) and len(chunk) < 45:
-              token = lines[j].strip()
-              norm_token = " ".join(token.split()).strip()
-              if split_isin_line(norm_token)[0]:
-                  break
-          '''
-
-          if old_block in text:
-              text = text.replace(old_block, new_block, 1)
+          old = (
+              '        if not ISIN_RE.fullmatch(normalized):\n'
+              '            i += 1\n'
+              '            continue\n\n'
+              '        isin = normalized\n'
+              '        chunk: list[str] = []\n'
+          )
+          new = (
+              '        isin, inline_tail = split_isin_line(normalized)\n'
+              '        if not isin:\n'
+              '            i += 1\n'
+              '            continue\n\n'
+              '        # Some CDSL PDF text layers emit ISIN and security description on one line.\n'
+              '        chunk: list[str] = [inline_tail] if inline_tail else []\n'
+          )
+          if old in text:
+              text = text.replace(old, new, 1)
           elif 'isin, inline_tail = split_isin_line(normalized)' not in text:
-              raise SystemExit('Holdings parser block not found')
+              raise SystemExit('ISIN record-start block not found')
 
-          text = text.replace(
-              'Every accepted row is arithmetic-validated before entering analytics.',
-              'Every accepted row is arithmetic-validated before entering analytics.\\n    v1.0.8 also accepts PDF rows where an ISIN and description share one line.',
-              1,
+          old_next = '            if ISIN_RE.fullmatch(norm_token):\n                break\n'
+          new_next = '            if split_isin_line(norm_token)[0]:\n                break\n'
+          if old_next in text:
+              text = text.replace(old_next, new_next, 1)
+          elif new_next not in text:
+              raise SystemExit('next-record stop block not found')
+
+          acct_old = '            if back_candidates:\n                current_account = back_candidates[-1]\n'
+          acct_new = (
+              '            if back_candidates and back_candidates[-1].upper() not in '
+              '{"TOTAL", "SUB TOTAL", "GRAND TOTAL"}:\n'
+              '                current_account = back_candidates[-1]\n'
           )
+          if acct_old in text:
+              text = text.replace(acct_old, acct_new, 1)
 
-          needle = '''            ["Compact cross-CAS reconciliation", "Implemented", APP_VERSION],
-              ["Holdings arithmetic/reconciliation quality gate", "Implemented", APP_VERSION],
-          '''
-          replacement = '''            ["Compact cross-CAS reconciliation", "Implemented", APP_VERSION],
-              ["Inline ISIN + security-description row recovery", "Implemented", APP_VERSION],
-              ["ACCOUNT HOLDER context hardening", "Implemented", APP_VERSION],
-              ["Holdings arithmetic/reconciliation quality gate", "Implemented", APP_VERSION],
-          '''
+          doc_old = '    Every accepted row is arithmetic-validated before entering analytics.\n'
+          doc_new = (
+              '    Every accepted row is arithmetic-validated before entering analytics.\n'
+              '    v1.0.8 also accepts rows where ISIN and description share one PDF text line.\n'
+          )
+          if doc_old in text and 'v1.0.8 also accepts rows' not in text:
+              text = text.replace(doc_old, doc_new, 1)
+
+          status_old = '            ["Compact cross-CAS reconciliation", "Implemented", APP_VERSION],\n'
+          status_new = (
+              '            ["Compact cross-CAS reconciliation", "Implemented", APP_VERSION],\n'
+              '            ["Inline ISIN + security-description row recovery", "Implemented", APP_VERSION],\n'
+              '            ["ACCOUNT HOLDER context hardening", "Implemented", APP_VERSION],\n'
+          )
           if 'Inline ISIN + security-description row recovery' not in text:
-              text = text.replace(needle, replacement, 1)
+              text = text.replace(status_old, status_new, 1)
 
-          app_path.write_text(text)
+          p.write_text(text)
 
-          req = Path('requirements.txt').read_text().replace(
-              'Requirements version: 1.0.7', 'Requirements version: 1.0.8'
-          )
-          Path('requirements.txt').write_text(req)
+          req = Path('requirements.txt')
+          req.write_text(req.read_text().replace('Requirements version: 1.0.7', 'Requirements version: 1.0.8'))
 
-          readme_path = Path('README.md')
-          readme = readme_path.read_text()
+          rp = Path('README.md')
+          readme = rp.read_text()
           readme = readme.replace('**Repository package version:** 1.0.7', '**Repository package version:** 1.0.8')
           readme = readme.replace('## What v1.0.7 implements', '## What v1.0.8 implements')
           readme = readme.replace('No additional source files are required for v1.0.7.', 'No additional source files are required for v1.0.8.')
           readme = readme.replace('The parser in v1.0.7 is a **defensive heuristic parser**', 'The parser in v1.0.8 is a **defensive heuristic parser**')
-
           marker = '\n## Next version candidates\n'
-          section = '''
-
-          ### v1.0.8 — CDSL reconciliation hardening
-
-          - accepts holdings rows where the PDF text layer emits `ISIN + security description` on the same line
-          - preserves the inline security/scheme description before numeric reconciliation
-          - stops record scanning when the next line *starts* with another ISIN, not only when that line is exactly an ISIN
-          - prefers the broker/account name following `ACCOUNT HOLDER` so nearby `Total`/`Sub Total` labels cannot replace the account name
-          - retains arithmetic validation and does not weaken the transaction quality gate
-          - specifically addresses the missing CDSL/Zerodha holdings isolated from the v1.0.7 reconciliation export
-          '''
+          section = (
+              '\n### v1.0.8 — CDSL reconciliation hardening\n\n'
+              '- recovers holdings when an ISIN and security description share one PDF-extracted line\n'
+              '- stops record scanning when the next line starts with another ISIN\n'
+              '- avoids nearby Total/Sub Total labels replacing the account name\n'
+              '- retains arithmetic validation and the strict transaction quality gate\n\n'
+          )
           if '### v1.0.8 — CDSL reconciliation hardening' not in readme:
               if marker not in readme:
-                  raise SystemExit('README version-history marker not found')
+                  raise SystemExit('README marker not found')
               readme = readme.replace(marker, section + marker, 1)
-          readme_path.write_text(readme)
+          rp.write_text(readme)
           PY
 
           python -m py_compile app.py
           grep -q 'APP_VERSION = "1.0.8"' app.py
           grep -q 'def split_isin_line' app.py
+          grep -q 'isin, inline_tail = split_isin_line(normalized)' app.py
 
       - name: Commit patched three-file build
         shell: bash
