@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.2
+# APP VERSION: 1.1.3
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-14"
@@ -2657,6 +2657,661 @@ def estimate_advice_impact(
 
 
 # -----------------------------------------------------------------------------
+# Zerodha workbook import and evidence-only reconciliation
+# -----------------------------------------------------------------------------
+
+def broker_number(value: Any) -> Decimal:
+    """Reject missing/non-finite amounts rather than silently turning them into zero."""
+    result = Decimal(str(value).strip().replace(",", ""))
+    if not result.is_finite():
+        raise ValueError("Missing or non-finite number")
+    return result
+
+
+def broker_date(value: Any) -> date:
+    """Excel dates or explicit ISO/Indian date strings; never interpret numbers as timestamps."""
+    if pd.isna(value):
+        raise ValueError("Missing date")
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        for pattern in ("%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(value.strip(), pattern).date()
+            except ValueError:
+                pass
+    raise ValueError("Unsupported date; expected an Excel date, YYYY-MM-DD or DD/MM/YYYY")
+
+
+def broker_report_blocks(raw: pd.DataFrame) -> list[pd.DataFrame]:
+    """Combined exports repeat report titles, summaries and tables within a sheet."""
+    starts = []
+    for index, (_, row) in enumerate(raw.iterrows()):
+        if any(re.search(r"^(?:P&L Statement for|Other Debits and Credits for).*from \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}", str(v).strip()) for v in row if pd.notna(v)):
+            starts.append(index)
+    if not starts:
+        return [raw]
+    return [raw.iloc[start:end] for start, end in zip(starts, starts[1:] + [len(raw)])]
+
+
+def import_zerodha_workbook(content: bytes, filename: str) -> dict[str, Any]:
+    """Read supported layouts by header signature; retain workbook/sheet/Excel row."""
+    tables = []
+    issues = []
+    digest = hashlib.sha256(content).hexdigest()
+    account_ids = set()
+    signatures = [
+        ("trades", {"symbol", "isin", "trade_date", "trade_type", "quantity", "price", "trade_id", "exchange", "segment"}),
+        ("holdings", {"isin", "quantity_available", "previous_closing_price"}),
+        ("ledger", {"particulars", "posting_date", "debit", "credit", "net_balance", "voucher_type"}),
+        ("dividends", {"symbol", "ex_date", "qty", "dividend_per_share", "total_dividend"}),
+        ("pnl", {"isin", "buy_value", "sell_value", "realized_p_l"}),
+        ("pnl_debits", {"particulars", "posting_date", "debit", "credit"}),
+    ]
+    for sheet, sheet_data in pd.read_excel(io.BytesIO(content), sheet_name=None, header=None, engine="openpyxl", dtype=object).items():
+        for values in sheet_data.itertuples(index=False, name=None):
+            for position, value in enumerate(values):
+                if str(value).strip().lower() == "client id":
+                    following = [str(v).strip().upper() for v in values[position + 1:] if pd.notna(v) and str(v).strip()]
+                    if following:
+                        account_ids.add(following[0])
+        for raw in broker_report_blocks(sheet_data):
+            found = None
+            for index, (_, row) in enumerate(raw.iterrows()):
+                names = [re.sub(r"[^a-z0-9]+", "_", str(v).strip().lower()).strip("_") if pd.notna(v) else "" for v in row]
+                for kind, required in signatures:
+                    if required <= set(names):
+                        found = (index, names, kind)
+                        break
+                if found:
+                    break
+            if not found:
+                issues.append(f"{filename} / {sheet}: unsupported sheet; no rows imported")
+                continue
+            index, names, kind = found
+            positions = [i for i, name in enumerate(names) if name]
+            if len({names[i] for i in positions}) != len(positions):
+                raise ValueError(f"{filename} / {sheet}: duplicate column names")
+            frame = raw.iloc[index + 1:, positions].copy()
+            frame.columns = [names[i] for i in positions]
+            frame = frame.dropna(how="all")
+            frame["source_row"] = frame.index + 1
+            frame["source_file"] = filename
+            frame["source_sheet"] = sheet
+            frame["source_sha256"] = digest
+            frame["asset_class"] = "MF" if sheet.strip().lower() == "mutual funds" else "Equity"
+            preamble = " ".join(str(v) for v in raw.iloc[:index].values.ravel() if pd.notna(v))
+            snapshot = re.search(r"as on (\d{4}-\d{2}-\d{2})", preamble, re.I)
+            period = re.search(r"from (\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})", preamble, re.I)
+            frame["report_period_start"] = period[1] if period else None
+            frame["report_period_end"] = period[2] if period else None
+            tables.append({"kind": kind, "data": frame, "as_of": date.fromisoformat(snapshot[1]) if snapshot else None,
+                           "period": (period[1], period[2]) if period else None,
+                           "header_row": int(raw.index[index]) + 1, "columns": list(frame.columns)})
+    return {"filename": filename, "sha256": digest, "tables": tables, "issues": issues, "account_ids": sorted(account_ids)}
+
+
+def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
+    """No inferred corporate actions and no automatic XIRR unlock from partial evidence."""
+    account_ids = {account for book in workbooks for account in book.get("account_ids", [])}
+    if len(account_ids) > 1:
+        raise ValueError("Multiple broker Client IDs detected; upload reports for one account only")
+    issues, rows, inventory = [], {}, []
+    unidentified = [book["filename"] for book in workbooks if not book.get("account_ids")]
+    if unidentified:
+        issues.append("Account identity absent from report headers: " + ", ".join(unidentified) + "; verify account scope manually")
+    seen_files = set()
+    snapshots = set()
+    seen_reference_tables = {}
+    seen_reference_periods = set()
+    for book in workbooks:
+        if book["sha256"] in seen_files:
+            issues.append(f"{book['filename']}: duplicate workbook ignored")
+            continue
+        seen_files.add(book["sha256"])
+        issues.extend(book["issues"])
+        for table in book["tables"]:
+            kind, frame = table["kind"], table["data"]
+            inventory.append({"file": book["filename"], "sheet": frame["source_sheet"].iloc[0] if len(frame) else "",
+                              "kind": kind, "rows": len(frame), "header_row": table.get("header_row"),
+                              "normalized_columns": ", ".join(table.get("columns", [])), "as_of": table["as_of"], "period": " to ".join(table["period"]) if table["period"] else "Not stated"})
+            if kind in ("pnl", "pnl_debits") and not frame.empty:
+                columns = sorted(c for c in frame.columns if not c.startswith("source_"))
+                def reference_value(value: Any) -> str:
+                    if pd.isna(value):
+                        return ""
+                    if isinstance(value, (int, float, Decimal)):
+                        return str(broker_number(value).normalize())
+                    return str(value).strip()
+                payload = sorted(tuple(reference_value(row[c]) for c in columns) for row in frame.to_dict("records"))
+                table_key = (kind, table["period"], tuple(columns), tuple(payload))
+                if table_key in seen_reference_tables:
+                    inventory[-1]["status"] = "Identical reference section ignored"
+                    issues.append(f"{book['filename']}: identical {kind} section for {table['period']} ignored; already supplied by {seen_reference_tables[table_key]}")
+                    continue
+                seen_reference_tables[table_key] = book["filename"]
+                period_key = (kind, table["period"])
+                if period_key in seen_reference_periods:
+                    issues.append(f"{kind}: differing sections cover the same period {table['period']}; retained for review, do not sum")
+                seen_reference_periods.add(period_key)
+            inventory[-1]["status"] = "Imported"
+            rows.setdefault(kind, []).append(frame)
+            if kind == "holdings":
+                snapshots.add(table["as_of"])
+    tables = {kind: pd.concat(parts, ignore_index=True) for kind, parts in rows.items()}
+    if "pnl" in tables:
+        reference = tables["pnl"].copy()
+        reference["reported_isin"] = reference["isin"]
+        reference["identifier_source"] = "isin"
+        for index, row in reference.iterrows():
+            if pd.isna(row["isin"]) and re.fullmatch(r"IN[A-Z0-9]{10}", str(row.get("symbol", "")).strip().upper()):
+                reference.loc[index, "isin"] = str(row["symbol"]).strip().upper()
+                reference.loc[index, "identifier_source"] = "symbol (explicit ISIN)"
+        count = int((reference["identifier_source"] != "isin").sum())
+        if count:
+            issues.append(f"{count} P&L reference rows use an explicit ISIN from the symbol field; review their open quantities and valuations")
+        tables["pnl"] = reference
+    pnl_periods = sorted({(r["report_period_start"], r["report_period_end"]) for r in tables.get("pnl", pd.DataFrame()).to_dict("records") if r["report_period_start"] and r["report_period_end"]})
+    seen_pnl_periods = set()
+    for part in rows.get("pnl", []):
+        if part.empty:
+            continue
+        period_key = (part.iloc[0]["report_period_start"], part.iloc[0]["report_period_end"])
+        if period_key in seen_pnl_periods:
+            issues.append("Repeated equity P&L period: upload a corrected report instead of both original and corrected versions")
+        seen_pnl_periods.add(period_key)
+    for earlier, later in zip(pnl_periods, pnl_periods[1:]):
+        if date.fromisoformat(later[0]) > date.fromisoformat(earlier[1]) + timedelta(days=1):
+            issues.append(f"Equity P&L coverage gap after {earlier[1]} and before {later[0]}")
+        elif later[0] <= earlier[1]:
+            issues.append("Equity P&L periods overlap; do not sum overlapping reports")
+    for kind in ("trades", "holdings", "ledger", "dividends", "pnl"):
+        if kind not in tables:
+            issues.append(f"Missing {kind} input")
+    as_of = next(iter(snapshots)) if len(snapshots) == 1 else None
+    if as_of is None:
+        issues.append("Holdings require one explicit common snapshot date")
+    trades, holdings, rejected = [], [], []
+    trade_keys = {}
+    conflicting_trade_keys = set()
+
+    def reject(row: dict, reason: str) -> None:
+        rejected.append({**row, "reason": reason})
+
+    for row in tables.get("trades", pd.DataFrame()).to_dict("records"):
+        try:
+            isin = str(row["isin"]).strip().upper()
+            if not re.fullmatch(r"IN[A-Z0-9]{10}", isin):
+                raise ValueError("Invalid ISIN")
+            side = str(row["trade_type"]).strip().lower()
+            qty, price = broker_number(row["quantity"]), broker_number(row["price"])
+            when = broker_date(row["trade_date"])
+            if str(row["segment"]).strip().upper() != ("MF" if row["asset_class"] == "MF" else "EQ"):
+                raise ValueError("Unsupported trade segment for this sheet")
+            if pd.isna(when) or side not in ("buy", "sell") or qty <= 0 or price <= 0:
+                raise ValueError("Invalid trade date, side, quantity or price")
+            start, end = row.get("report_period_start"), row.get("report_period_end")
+            if start and end and not date.fromisoformat(start) <= when <= date.fromisoformat(end):
+                raise ValueError("Trade date outside stated report period")
+            identity = tuple(str(row[k]).strip() for k in ("exchange", "segment", "trade_id"))
+            if any(v in ("", "nan", "None") for v in identity):
+                raise ValueError("Missing trade identity")
+            key = (when, *identity)
+            payload = (isin, side, qty, price, str(row.get("order_id", "")))
+            if key in trade_keys:
+                if trade_keys[key] != payload or key in conflicting_trade_keys:
+                    conflicting_trade_keys.add(key)
+                    # Neither version is authoritative when a trade identity conflicts.
+                    retained = []
+                    for accepted in trades:
+                        accepted_key = (accepted["trade_date"], *(str(accepted[k]).strip() for k in ("exchange", "segment", "trade_id")))
+                        if accepted_key == key:
+                            reject(accepted, "Conflicting trade identity")
+                        else:
+                            retained.append(accepted)
+                    trades = retained
+                    raise ValueError("Conflicting trade identity")
+                raise ValueError("Duplicate trade identity")
+            trade_keys[key] = payload
+            row = {**row, "isin": isin, "trade_date": when, "quantity": qty, "price": price,
+                   "signed_quantity": qty if side == "buy" else -qty, "gross_consideration": qty * price}
+            if as_of is None or when > as_of:
+                raise ValueError("Trade cannot be aligned to holdings snapshot")
+            trades.append(row)
+        except (ValueError, TypeError, InvalidOperation, OverflowError) as exc:
+            reject(row, str(exc))
+    holding_keys = set()
+    for row in tables.get("holdings", pd.DataFrame()).to_dict("records"):
+        try:
+            isin = str(row["isin"]).strip().upper()
+            identifier_source = "isin"
+            if pd.isna(row["isin"]) and re.fullmatch(r"IN[A-Z0-9]{10}", str(row.get("symbol", "")).strip().upper()):
+                isin = str(row["symbol"]).strip().upper()
+                identifier_source = "symbol (explicit ISIN)"
+            if not re.fullmatch(r"IN[A-Z0-9]{10}", isin):
+                raise ValueError("Invalid ISIN")
+            key = (row["asset_class"], isin)
+            if key in holding_keys:
+                raise ValueError("Duplicate holding snapshot/ISIN; select one account snapshot")
+            qty, price = broker_number(row["quantity_available"]), broker_number(row["previous_closing_price"])
+            if qty < 0 or price < 0:
+                raise ValueError("Negative holding quantity/price")
+            if qty > 0 and price == 0:
+                issues.append(f"{isin}: positive quantity has no reported market value")
+            # These balances are not added to available quantity without broker evidence.
+            extras = [broker_number(row.get(k, 0)) for k in ("quantity_discrepant", "quantity_pledged_margin", "quantity_pledged_loan")]
+            if any(extras):
+                issues.append(f"{isin}: discrepant/pledged balances require quantity-definition review")
+            holding_keys.add(key)
+            holdings.append({**row, "isin": isin, "identifier_source": identifier_source, "quantity_available": qty, "market_value": qty * price})
+        except (ValueError, TypeError, InvalidOperation) as exc:
+            reject(row, str(exc))
+    symbol_isins, isin_symbols = {}, {}
+    for row in trades + holdings:
+        symbol = str(row.get("symbol", "")).strip().upper()
+        if symbol and symbol != "NAN":
+            symbol_isins.setdefault(symbol, set()).add(row["isin"])
+            isin_symbols.setdefault(row["isin"], set()).add(symbol)
+    for symbol, identifiers in sorted(symbol_isins.items()):
+        if len(identifiers) > 1:
+            issues.append(f"Symbol {symbol} has multiple ISINs: {', '.join(sorted(identifiers))}; name changes/corporate actions require evidence")
+    for isin, symbols in sorted(isin_symbols.items()):
+        if len(symbols) > 1:
+            issues.append(f"{isin} has multiple reported symbols: {', '.join(sorted(symbols))}; retained by explicit ISIN, no rename inferred")
+    identifier_review = []
+    for row in rejected:
+        if row["reason"] != "Invalid ISIN":
+            continue
+        symbol = str(row.get("symbol", "")).strip().upper()
+        candidates = sorted(symbol_isins.get(symbol, set()))
+        identifier_review.append({
+            "source_file": row.get("source_file"), "source_sheet": row.get("source_sheet"),
+            "source_row": row.get("source_row"), "symbol": symbol,
+            "reported_isin": row.get("isin"), "trade_date": row.get("trade_date"),
+            "candidate_isins": ", ".join(candidates),
+            "status": "Candidate requires source confirmation" if candidates else "No candidate in accepted inputs",
+            "basis": "Exact symbol in accepted trades/holdings only; not an ISIN assignment. Rejected row remains excluded.",
+        })
+    totals, held, labels = {}, {}, {}
+    for row in trades:
+        key = (row["asset_class"], row["isin"])
+        totals[key] = totals.get(key, Decimal(0)) + row["signed_quantity"]
+        labels[key] = row["symbol"]
+    for row in holdings:
+        key = (row["asset_class"], row["isin"])
+        held[key] = row["quantity_available"]
+        labels[key] = row["symbol"]
+    reconciliation = []
+    for key in sorted(totals.keys() | held.keys()):
+        delta = held.get(key, Decimal(0)) - totals.get(key, Decimal(0))
+        reconciliation.append({"asset_class": key[0], "isin": key[1], "symbol": labels[key],
+            "in_holdings": key in held, "net_trade_quantity": totals.get(key, Decimal(0)),
+            "reported_quantity": held.get(key), "difference": delta,
+            "status": "Quantity agrees" if abs(delta) <= Decimal("0.000001") else "Unresolved quantity",
+            "basis": "Zero opening assumed; missing holdings treated as zero for comparison only"})
+    ledger, external = [], []
+    previous = None
+    opening = closing = None
+    previous_date = None
+    ledger_parts = rows.get("ledger", [])
+    if len(ledger_parts) > 1:
+        issues.append("Multiple ledger sheets/uploads: continuity is checked separately; do not combine overlapping accounts")
+    for part in ledger_parts:
+        previous = previous_date = None
+        controls = part["particulars"].astype(str).str.strip().str.lower()
+        if (controls == "opening balance").sum() != 1 or (controls == "closing balance").sum() != 1:
+            issues.append("Ledger requires exactly one opening and one closing control row per sheet")
+        for row in part.to_dict("records"):
+            try:
+                balance = broker_number(row["net_balance"])
+                label = str(row["particulars"]).strip().lower()
+                if label == "opening balance":
+                    if previous is not None:
+                        raise ValueError("Repeated opening balance")
+                    opening = previous = balance
+                    continue
+                if label == "closing balance":
+                    closing = balance
+                    continue
+                debit, credit = broker_number(row["debit"]), broker_number(row["credit"])
+                when = broker_date(row["posting_date"])
+                if pd.isna(when) or debit < 0 or credit < 0:
+                    raise ValueError("Invalid ledger date/debit/credit")
+                difference = None if previous is None else balance - (previous + credit - debit)
+                if previous_date and when < previous_date:
+                    issues.append(f"Ledger row {row['source_row']}: dates out of order")
+                previous, previous_date = balance, when
+                voucher = str(row["voucher_type"]).strip().lower()
+                cashflow = debit - credit if voucher in ("bank receipts", "bank payments") else Decimal(0)
+                record = {**row, "posting_date": when, "debit": debit, "credit": credit,
+                          "net_balance": balance, "source_order_balance_difference": difference,
+                          "candidate_external_cashflow": cashflow}
+                ledger.append(record)
+                if cashflow:
+                    external.append(record)
+            except (ValueError, TypeError, InvalidOperation, OverflowError) as exc:
+                reject(row, str(exc))
+    if opening is None or closing is None:
+        issues.append("Ledger opening/closing control balance missing")
+    ledger_checks = []
+    if len(ledger_parts) == 1 and opening is not None:
+        running = opening
+        ledger_frame = pd.DataFrame(ledger)
+        if not ledger_frame.empty:
+            for when, group in ledger_frame.groupby("posting_date", sort=True):
+                pending = group.to_dict("records")
+                expected_close = running + sum((r["credit"] - r["debit"] for r in pending), Decimal(0))
+                chain_balance = running
+                while pending:
+                    match = next((i for i, r in enumerate(pending) if abs(chain_balance + r["credit"] - r["debit"] - r["net_balance"]) <= Decimal("0.01")), None)
+                    if match is None:
+                        break
+                    chain_balance = pending.pop(match)["net_balance"]
+                ledger_checks.append({"date": when, "opening": running, "expected_close": expected_close,
+                                      "unlinked_rows": len(pending), "status": "Balance chain agrees" if not pending else "Unresolved balance chain"})
+                running = expected_close
+            if any(r["unlinked_rows"] for r in ledger_checks):
+                issues.append("Ledger daily balance chains contain unlinked rows; inspect daily controls")
+            if closing is None or abs(running - closing) > Decimal("0.01"):
+                issues.append("Ledger opening plus credits minus debits does not equal closing")
+        if opening != 0:
+            issues.append("Nonzero ledger opening: earlier cashflow history required")
+    if any("F&O" in str(r.get("cost_center", "")) or "F&O" in str(r.get("particulars", "")) for r in ledger):
+        issues.append("Ledger includes F&O activity; derivative trades/positions are not supplied in these equity/MF tradebooks")
+    dividends = []
+    for row in tables.get("dividends", pd.DataFrame()).to_dict("records"):
+        try:
+            qty, rate, amount = (broker_number(row[k]) for k in ("qty", "dividend_per_share", "total_dividend"))
+            when = broker_date(row["ex_date"])
+            if pd.isna(when) or min(qty, rate, amount) < 0 or abs(qty * rate - amount) > Decimal("0.01"):
+                raise ValueError("Dividend amount/date fails validation")
+            dividends.append({**row, "ex_date": when, "total_dividend": amount,
+                              "cashflow_status": "Payment date and receipt unverified; excluded from XIRR"})
+        except (ValueError, TypeError, InvalidOperation, OverflowError) as exc:
+            reject(row, str(exc))
+    if rejected:
+        issues.append(f"{len(rejected)} rows rejected or duplicated; inspect row audit")
+    issues.extend([
+        "Net trades assume zero opening positions; corporate actions, transfers and missing history remain unverified.",
+        "Dividend ex-dates are not payment dates; payment evidence and ledger overlap must be reconciled.",
+        "P&L is a period-limited reference, not additional cashflow or current holdings; charges must not be added again to ledger settlements.",
+        "CAS account/date alignment has not been established; broker quantities are not a full CAS reconciliation.",
+    ])
+    return {"account_ids": sorted(account_ids), "identifier_review": pd.DataFrame(identifier_review), "inventory": pd.DataFrame(inventory), "trades": pd.DataFrame(trades), "holdings": pd.DataFrame(holdings),
+            "reconciliation": pd.DataFrame(reconciliation), "ledger": pd.DataFrame(ledger),
+            "ledger_checks": pd.DataFrame(ledger_checks),
+            "external_cashflows": pd.DataFrame(external), "dividends": pd.DataFrame(dividends),
+            "pnl": tables.get("pnl", pd.DataFrame()), "pnl_debits": tables.get("pnl_debits", pd.DataFrame()),
+            "rejected": pd.DataFrame(rejected), "issues": issues, "as_of": as_of,
+            "opening_cash": opening, "closing_cash": closing, "xirr_ready": False}
+
+
+def compare_broker_cas_snapshot(broker: pd.DataFrame, cas: pd.DataFrame,
+                                broker_date: date | None, cas_date: date | None) -> pd.DataFrame:
+    """The caller selects one CAS statement and one broker account, never all accounts."""
+    if broker_date is None or cas_date is None or broker_date != cas_date:
+        raise ValueError("CAS and broker snapshot dates must match; no cross-date comparison is inferred")
+    if broker.empty or cas.empty:
+        raise ValueError("Both selected snapshots must contain holdings")
+    if not {"isin", "quantity_inferred"} <= set(cas.columns):
+        raise ValueError("CAS holdings lack ISIN/quantity fields")
+    sides = []
+    for frame, quantity in ((broker, "quantity_available"), (cas, "quantity_inferred")):
+        values = {}
+        for row in frame.to_dict("records"):
+            isin = str(row["isin"]).strip().upper()
+            if not re.fullmatch(r"IN[A-Z0-9]{10}", isin) or isin in values:
+                raise ValueError("Invalid or repeated ISIN in selected snapshot; review account scope")
+            values[isin] = broker_number(row[quantity])
+            if values[isin] < 0:
+                raise ValueError("Negative snapshot quantity requires review")
+        sides.append(values)
+    left, right = sides
+    return pd.DataFrame([{"isin": isin, "broker_quantity": left.get(isin), "cas_quantity": right.get(isin),
+        "difference": left.get(isin, Decimal(0)) - right.get(isin, Decimal(0)),
+        "status": ("Missing from one snapshot" if isin not in left or isin not in right else
+                   "Quantity agrees" if abs(left[isin] - right[isin]) <= Decimal("0.000001") else "Unresolved quantity")}
+        for isin in sorted(left.keys() | right.keys())])
+
+
+def import_contract_notes(content: bytes, filename: str) -> dict[str, Any]:
+    """Strict supported contract-note schema; settlement dates come only from notes."""
+    records, excluded, accounts = [], [], set()
+    digest = hashlib.sha256(content).hexdigest()
+    for sheet, raw in pd.read_excel(io.BytesIO(content), sheet_name=None, header=None, dtype=object, engine="openpyxl").items():
+        def field(label: str) -> str:
+            matches = []
+            for values in raw.itertuples(index=False, name=None):
+                for i, value in enumerate(values):
+                    if str(value).strip().rstrip(":.").lower() == label:
+                        following = [str(v).strip() for v in values[i + 1:] if pd.notna(v) and str(v).strip()]
+                        if following:
+                            matches.append(following[0])
+            if len(matches) != 1:
+                raise ValueError(f"{sheet}: missing or ambiguous {label}")
+            return matches[0]
+        account = field("ucc of client").upper()
+        if not re.fullmatch(r"[A-Z0-9]+", account):
+            raise ValueError(f"{sheet}: invalid client identifier")
+        accounts.add(account)
+        when = datetime.strptime(field("trade date"), "%d-%m-%Y").date()
+        # NCL-Cash is explicitly the settlement column for the supported equity layout.
+        cash = [(i, j) for i, row in raw.iterrows() for j, v in enumerate(row) if str(v).strip() == "NCL-Cash" and i < 10]
+        if len(cash) != 1:
+            raise ValueError(f"{sheet}: ambiguous cash settlement column")
+        settlement_rows = [i for i, row in raw.iterrows() if any(str(v).strip().lower().rstrip(".") == "settlement date" for v in row)]
+        if len(settlement_rows) != 1:
+            raise ValueError(f"{sheet}: missing settlement date")
+        settled = datetime.strptime(str(raw.iloc[settlement_rows[0], cash[0][1]]).strip(), "%d/%m/%Y").date()
+        if settled < when:
+            raise ValueError(f"{sheet}: settlement precedes trade")
+        headers = []
+        for i, row in raw.iterrows():
+            names = [re.sub(r"[^a-z0-9]+", "_", str(v).strip().lower()).strip("_") if pd.notna(v) else "" for v in row]
+            if {"trade_no", "quantity", "exchange", "buy_b_sell_s", "security_contract_description"} <= set(names):
+                headers.append((i, names))
+        if len(headers) != 1:
+            raise ValueError(f"{sheet}: missing or ambiguous trade header")
+        index, names = headers[0]
+        required = {"trade_no", "quantity", "exchange", "buy_b_sell_s", "security_contract_description", "gross_rate_trade_price_per_unit_rs", "net_total_before_levies_rs"}
+        if not required <= set(names) or len([n for n in names if n]) != len(set(n for n in names if n)):
+            raise ValueError(f"{sheet}: unsupported or duplicate columns")
+        for i, values in raw.iloc[index + 1:].iterrows():
+            row = dict(zip(names, values))
+            side = str(row.get("buy_b_sell_s", "")).strip()
+            if side not in ("B", "S"):
+                # A nonblank trade number must never disappear as a footer.
+                if pd.notna(row.get("trade_no")):
+                    raise ValueError(f"{sheet} row {i+1}: unsupported trade side")
+                continue
+            description = str(row["security_contract_description"]).strip()
+            provenance = {"source_file": filename, "source_sha256": digest, "source_sheet": sheet, "source_row": i + 1}
+            isin = re.search(r"/(IN[A-Z0-9]{10})$", description)
+            if not isin:
+                if re.fullmatch(r"[A-Z0-9]+(?:CE|PE|FUT)", description):
+                    excluded.append({**provenance, "description": description, "reason": "Derivative excluded from equity quantity bridge"})
+                    continue
+                raise ValueError(f"{sheet} row {i+1}: missing equity ISIN")
+            qty = broker_number(row["quantity"])
+            price = broker_number(row["gross_rate_trade_price_per_unit_rs"])
+            amount = broker_number(row["net_total_before_levies_rs"])
+            identity = str(row["trade_no"]).strip()
+            exchange = str(row["exchange"]).strip().upper()
+            if qty <= 0 or price <= 0 or identity in ("", "nan", "None") or exchange not in ("NSE", "BSE"):
+                raise ValueError(f"{sheet} row {i+1}: invalid trade fields")
+            if abs(amount - qty * price * (-1 if side == "B" else 1)) > Decimal("0.01"):
+                raise ValueError(f"{sheet} row {i+1}: gross consideration arithmetic mismatch")
+            records.append({**provenance, "account_id": account, "trade_date": when, "settlement_date": settled,
+                            "trade_id": identity, "exchange": exchange, "isin": isin[1], "side": side,
+                            "quantity": qty, "price": price})
+    if len(accounts) != 1 or not records:
+        raise ValueError("Contract notes require one account and at least one equity trade")
+    frame = pd.DataFrame(records)
+    if frame.duplicated(["trade_date", "exchange", "trade_id"]).any():
+        raise ValueError("Repeated contract-note trade identity; duplicates or conflicts require review")
+    return {"trades": frame, "excluded": pd.DataFrame(excluded), "account_id": next(iter(accounts))}
+
+
+def reconcile_contract_settlements(notes: dict[str, Any], broker: dict[str, Any], cas: pd.DataFrame,
+                                   cas_date: date, expected_account: str, cas_quality_valid: bool) -> dict[str, Any]:
+    """Documentary quantity bridge only; never promotes broker data to XIRR-ready."""
+    closing = broker.get("as_of")
+    if not cas_quality_valid or cas_date is None or closing is None or cas_date >= closing:
+        raise ValueError("Passed CAS holdings quality and an earlier CAS date are required")
+    if notes["account_id"] != expected_account.strip().upper():
+        raise ValueError("Contract-note account does not match the confirmed broker account")
+    for frame, quantity in ((broker["holdings"], "quantity_available"), (cas, "quantity_inferred")):
+        if frame.empty or not {"isin", quantity} <= set(frame.columns):
+            raise ValueError("Both account snapshots require ISIN and quantity")
+        identities = set()
+        for row in frame.to_dict("records"):
+            isin = str(row["isin"]).strip().upper()
+            if not re.fullmatch(r"IN[A-Z0-9]{10}", isin) or isin in identities or broker_number(row[quantity]) < 0:
+                raise ValueError("Invalid, repeated or negative snapshot holding")
+            identities.add(isin)
+    if broker.get("account_ids") and set(broker["account_ids"]) != {notes["account_id"]}:
+        raise ValueError("Broker reports and contract notes belong to different accounts")
+    contracts = notes["trades"]
+    begin = min(contracts.trade_date)
+    if begin > cas_date:
+        raise ValueError("Contract-note coverage must start on or before the CAS date")
+    trades = broker["trades"]
+    if trades.empty:
+        raise ValueError("Accepted broker trades are required")
+    rejected = broker.get("rejected", pd.DataFrame())
+    for row in rejected.to_dict("records"):
+        if "trade_date" not in row or pd.isna(row.get("trade_date")):
+            continue
+        try:
+            when = broker_date(row["trade_date"])
+        except ValueError:
+            raise ValueError("Rejected trade has an unresolvable date; coverage is uncertain")
+        if begin <= when <= closing:
+            raise ValueError("Rejected/duplicate broker trades occur inside contract-note coverage")
+    relevant = trades[(trades.trade_date >= begin) & (trades.trade_date <= closing)]
+    if (relevant.asset_class != "Equity").any():
+        raise ValueError("MF trades in this window need separate settlement evidence")
+    def key(row: dict) -> tuple:
+        return row["trade_date"], str(row["exchange"]).strip(), str(row["trade_id"]).strip()
+    lookup = {key(row): row for row in relevant.to_dict("records")}
+    if len(lookup) != len(relevant):
+        raise ValueError("Ambiguous broker trade identities")
+    matched, seen, movements = [], set(), {}
+    for row in contracts[contracts.trade_date <= closing].to_dict("records"):
+        identity = key(row)
+        original = lookup.get(identity)
+        if original is None:
+            raise ValueError("Contract-note trade missing from accepted broker tradebook")
+        if row["isin"] != original["isin"] or row["quantity"] != original["quantity"] or row["side"] != ("B" if original["signed_quantity"] > 0 else "S"):
+            raise ValueError("Contract note and tradebook disagree on ISIN, side or quantity")
+        seen.add(identity)
+        difference = row["price"] - original["price"]
+        matched.append({**row, "tradebook_price": original["price"], "price_difference": difference,
+                        "price_status": "Exact" if difference == 0 else "Price discrepancy; monetary review required"})
+        if cas_date < row["settlement_date"] <= closing:
+            movements[row["isin"]] = movements.get(row["isin"], Decimal(0)) + row["quantity"] * (1 if row["side"] == "B" else -1)
+    if seen != set(lookup):
+        raise ValueError("Contract notes do not cover every broker trade in the comparison window")
+    starts = {r["isin"].strip().upper(): broker_number(r["quantity_inferred"]) for r in cas.to_dict("records")}
+    ends = {r["isin"]: broker_number(r["quantity_available"]) for r in broker["holdings"].to_dict("records")}
+    comparison = []
+    for isin in sorted(starts.keys() | ends.keys() | movements.keys()):
+        expected = starts.get(isin, Decimal(0)) + movements.get(isin, Decimal(0))
+        difference = ends.get(isin, Decimal(0)) - expected
+        comparison.append({"isin": isin, "cas_quantity": starts.get(isin, Decimal(0)), "settled_net_quantity": movements.get(isin, Decimal(0)),
+                           "expected_quantity": expected, "broker_quantity": ends.get(isin, Decimal(0)), "difference": difference,
+                           "status": "Quantity agrees" if expected >= 0 and abs(difference) <= Decimal("0.000001") else "Unresolved exception"})
+    return {"comparison": pd.DataFrame(comparison), "matches": pd.DataFrame(matched), "excluded": notes["excluded"],
+            "later_notes": contracts[contracts.trade_date > closing], "xirr_ready": False}
+
+
+def render_broker_imports() -> None:
+    st.title("Broker Imports & Reconciliation")
+    st.caption("Zerodha Excel reports · Select files for one account and one holdings date. Files stay in this session.")
+    uploads = st.file_uploader("Tradebooks, holdings, ledger, dividends and P&L", type=["xlsx"], accept_multiple_files=True, key="broker_uploads")
+    fingerprint = tuple((f.name, hashlib.sha256(f.getvalue()).hexdigest()) for f in uploads)
+    if st.session_state.get("broker_fingerprint") != fingerprint:
+        st.session_state.pop("broker_result", None)
+    if st.button("Import and reconcile", disabled=not uploads):
+        st.session_state.pop("broker_result", None)
+        try:
+            books = [import_zerodha_workbook(f.getvalue(), f.name) for f in uploads]
+            st.session_state.broker_result = reconcile_zerodha(books)
+            st.session_state.broker_fingerprint = fingerprint
+        except Exception as exc:
+            st.error(f"Import failed: {exc}")
+    result = st.session_state.get("broker_result")
+    if result is None:
+        return
+    st.error("Full XIRR remains blocked: cashflow completeness, corporate actions/transfers and CAS alignment require verification.")
+    st.write(f"Holdings snapshot: {result['as_of'] or 'Unresolved'}")
+    st.dataframe(result["inventory"], use_container_width=True)
+    rec = result["reconciliation"]
+    if not rec.empty:
+        current = rec[rec["in_holdings"]]
+        cols = st.columns(3)
+        cols[0].metric("Imported trades", len(result["trades"]))
+        cols[1].metric("Current quantities agree", int((current["status"] == "Quantity agrees").sum()))
+        cols[2].metric("Unresolved ISINs (including historical)", int((rec["status"] != "Quantity agrees").sum()))
+    for issue in result["issues"]:
+        st.warning(issue)
+    st.caption("Quantity agreement is a comparison under a zero-opening assumption, not proof of complete history. No adjustments are invented.")
+    cas_results = st.session_state.get("cas_results", [])
+    with st.expander("Compare with a CAS account snapshot"):
+        if not cas_results:
+            st.info("Parse a CAS statement first. Comparison requires the same holdings date and the corresponding broker account.")
+        else:
+            selected = st.selectbox("CAS statement", range(len(cas_results)), format_func=lambda i: cas_results[i]["filename"], key="broker_cas_statement")
+            statement = cas_results[selected]
+            cas_holdings = statement.get("holdings", pd.DataFrame())
+            if not statement.get("holdings_quality", {}).get("valid", False):
+                st.warning("CAS holdings quality gate has not passed; comparison is blocked")
+            elif "account" in cas_holdings.columns:
+                accounts = sorted(cas_holdings["account"].dropna().unique())
+                account = st.selectbox("Corresponding Zerodha account in CAS", [None] + accounts, key="broker_cas_account")
+                if account is not None:
+                    try:
+                        comparison = compare_broker_cas_snapshot(result["holdings"], cas_holdings[cas_holdings["account"] == account], result["as_of"], statement.get("holdings_as_of"))
+                        st.dataframe(comparison.astype(str), use_container_width=True)
+                        df_download("Download CAS comparison", comparison, "zerodha_cas_comparison.csv", "broker_cas_csv")
+                        st.caption("This compares quantities only. It does not validate consideration, transfers, corporate actions or XIRR completeness.")
+                    except (ValueError, InvalidOperation) as exc:
+                        st.warning(str(exc))
+                    st.markdown("#### Reconcile using documented settlements")
+                    contract_upload = st.file_uploader("Contract-note workbook", type=["xlsx"], key="contract_notes_upload")
+                    confirmed_account = st.text_input("Broker trading account (UCC)", key="contract_account")
+                    confirmed = st.checkbox("I confirm this CAS account and these broker reports belong to the entered trading account", key="contract_account_confirm")
+                    if st.button("Check documented settlements", disabled=contract_upload is None or not confirmed or not confirmed_account.strip()):
+                        try:
+                            notes = import_contract_notes(contract_upload.getvalue(), contract_upload.name)
+                            settlement = reconcile_contract_settlements(notes, result, cas_holdings[cas_holdings["account"] == account],
+                                statement.get("holdings_as_of"), confirmed_account, bool(statement.get("holdings_quality", {}).get("valid")))
+                            comparison = settlement["comparison"]
+                            agrees = int((comparison["status"] == "Quantity agrees").sum())
+                            st.info(f"Documented settlement quantities agree for {agrees} of {len(comparison)} ISINs.")
+                            st.caption("Quantity comparison only. Earlier unsettled positions, depository delivery, transfers and cashflow completeness are not independently verified. XIRR remains blocked.")
+                            for name, table in settlement.items():
+                                if isinstance(table, pd.DataFrame):
+                                    st.write(name.replace("_", " ").title())
+                                    st.dataframe(table.astype(str), use_container_width=True)
+                                    df_download("Download " + name.replace("_", " "), table, "settlement_" + name + ".csv", "settlement_" + name)
+                        except (ValueError, TypeError, KeyError, InvalidOperation) as exc:
+                            st.error(f"Settlement check blocked: {exc}")
+            else:
+                st.warning("CAS account identifiers are unavailable; select a statement with identifiable accounts")
+    for key, label in [("reconciliation", "Quantity reconciliation"), ("rejected", "Rejected/duplicate row audit"), ("identifier_review", "Missing ISIN evidence review"),
+                       ("trades", "Trades (gross consideration, before charges)"), ("holdings", "Holdings"),
+                       ("ledger", "Ledger (original row order)"), ("ledger_checks", "Daily ledger balance controls"), ("external_cashflows", "Candidate bank cashflows (investor sign)"),
+                       ("dividends", "Dividend reference"), ("pnl", "P&L reference"), ("pnl_debits", "P&L debit/credit reference")]:
+        with st.expander(label, expanded=key in ("reconciliation", "rejected")):
+            st.dataframe(result[key].astype(str), use_container_width=True)
+            df_download("Download CSV", result[key], f"zerodha_{key}.csv", f"broker_{key}_csv")
+
+
+
+# -----------------------------------------------------------------------------
 # Session state
 # -----------------------------------------------------------------------------
 
@@ -2684,6 +3339,7 @@ section = st.sidebar.radio(
     [
         "Home",
         "CAS Parser & Reconciliation",
+        "Broker Imports & Reconciliation",
         "XIRR & Benchmarking",
         "Tax Lots",
         "Return Attribution",
@@ -2976,6 +3632,10 @@ elif section == "CAS Parser & Reconciliation":
 # -----------------------------------------------------------------------------
 # XIRR & Benchmarking
 # -----------------------------------------------------------------------------
+
+elif section == "Broker Imports & Reconciliation":
+    render_broker_imports()
+
 
 elif section == "XIRR & Benchmarking":
     st.title("XIRR & Benchmarking")

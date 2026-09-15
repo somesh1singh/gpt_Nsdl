@@ -1,6 +1,91 @@
 # NSDL CAS Portfolio Intelligence & Advisory System
 
-**Repository package version:** 1.1.2
+**Repository package version:** 1.1.3
+
+## Broker imports and reconciliation (development)
+
+Built from v1.1.2, commit `12c4857`. Deployment still consists of exactly
+`README.md`, `requirements.txt` and `app.py`; Excel reading adds `openpyxl==3.1.5`.
+
+Open **Broker Imports & Reconciliation** and upload the equity tradebook, MF
+tradebook, holdings, ledger statement, dividend report and P&L report for one
+Zerodha account. Click **Import and reconcile**. Header detection supports the
+supplied Excel layouts, including report preambles, both holdings sheets and
+the P&L debit/credit sheet and repeated financial-year sections in combined
+P&L workbooks. Each imported row retains its report period, filename, sheet,
+Excel row number and workbook hash. Changing uploads clears stale results.
+Inputs are read in memory and are not saved to the repository by the app.
+
+The module compares net trades with reported available quantities by ISIN,
+including historical ISINs absent from current holdings. It assumes zero
+opening positions for this comparison only. Quantity agreement does not prove
+complete history. Missing ISINs, invalid amounts/dates, repeated trade identities
+and conflicting/duplicate snapshots remain visible in the row audit. Identical
+workbooks are ignored on repeat upload. An explicit ISIN in the symbol field is
+recognized and its source is recorded; symbols are never silently mapped to ISINs.
+Pledged/discrepant balances and zero-valued positions require review.
+
+Ledger controls preserve source order and separately reconstruct daily balance
+chains within ₹0.01, accommodating same-day rows displayed out of balance order.
+Bank receipts/payments are exported as **candidate** investor cashflows (deposits
+negative, withdrawals positive). Trade consideration and P&L are not added to
+these flows. Dividend ex-dates are not payment dates, so dividend rows remain
+reference evidence. P&L stays period-scoped and does not become current holdings
+or additional cashflows. Downloadable CSVs expose normalized rows, quantity
+differences, rejected rows and daily ledger controls.
+
+A CAS comparison requires a parsed statement with a passed holdings-quality gate,
+an explicitly selected account and the exact same holdings date. Cross-date comparisons and duplicate ISINs
+in an account snapshot are blocked. This snapshot comparison does not resolve
+corporate actions, transfers or monetary completeness. **Broker XIRR remains
+blocked**, and the existing CAS XIRR quality gates are unchanged.
+
+Validation against the six supplied workbooks: 8,033 equity source trades,
+8,018 with usable ISINs and 15 quarantined for missing ISINs; 25 MF trades;
+52 equity holdings (including one unlisted, zero-valued discrepant holding)
+and 11 MF holdings; 2,079 ledger entries; 207 dividend records. Of current
+holdings, 43 equity and 5 MF quantities agree; 9 equity and 6 MF quantities
+remain unresolved. All 667 daily ledger balance chains agree within ₹0.01.
+The corrected P&L supersedes the earlier FY 2021–22 file. Add `pnl-2023-24.xlsx`
+alongside `pnl-corrected.xlsx`: together they contain 712 equity rows across all
+six reporting periods through 2026-09-08. The supplement fills the previously
+missing FY 2023–24 section with 71 rows. Its 57 debit/credit rows exactly repeat
+the corrected workbook's section and are ignored, leaving 610 debit/credit rows.
+Identical reference sections are detected by period and full content, even if
+row order differs; inventory records the ignored section. Differing sections for
+the same period are retained and flagged for review. Ledger F&O activity
+is flagged because corresponding derivative trade/position reports are absent.
+
+Verification on 2026-09-15 passed on Python 3.14.7 with every pinned dependency,
+including pandas 3.0.5 and openpyxl 3.1.5. Full app imports, Home and broker UI,
+actual-data rendering, rejected CAS quality gate, actual-file arithmetic and
+regression checks passed. All 82 pre-existing functions/classes remain unchanged.
+
+Six separate annual tradebooks also import with headers on Excel rows 14/15:
+61, 26, 388, 4,243, 2,553 and 781 source rows. With the combined MF tradebook,
+8,045 trades are accepted against the 2026-09-08 snapshot; 15 missing-ISIN rows
+and 17 later trades are quarantined. Use combined OR annual equity reports,
+not both. The two source sets are not asserted to be identical.
+Normalized columns/header rows are exposed in diagnostics. Dates outside a
+report period are rejected. Multiple symbols per ISIN or ISINs per symbol are
+explicit review warnings; no corporate-action or rename adjustment is inferred.
+
+The corrected August CAS has now been validated: 72 positive holdings agree
+with its total within ₹0.02 and all 59 structured transactions pass the existing
+gate. Cross-date settlement verification remains pending; automated XIRR stays blocked.
+
+Additional hardening quarantines every conflicting version of a trade identity,
+regardless of input order. Missing ISIN rows have a separate review table showing
+exact-symbol candidates from accepted input only; no identifier is assigned and
+no rejected row is admitted. Explicit broker Client IDs are read from workbook
+headers; multiple IDs block import. Missing IDs produce an account-scope warning.
+This check does not establish a trading-account-to-demat-account mapping.
+
+Actual-file and controlled regression tests passed on Python 3.14.7, including
+mixed MYR879/JQ6218 report rejection, conflict upload-order independence, missing
+identifier diagnostics and Streamlit rendering. All 82 baseline definitions remain
+unchanged. Version 1.1.3 includes the documented-settlement integration described below.
+
 **Blueprint implementation baseline:** 1.0
 **Target Python:** 3.14
 **Entrypoint:** `app.py`
@@ -327,3 +412,35 @@ Acceptance target for this revision:
   market values to the NSDL statement totals within a small tolerance;
 - cross-CAS reconciliation should contain one meaningful row per security rather
   than a Cartesian product.
+
+## Documented settlement comparison (v1.1.3)
+
+1. Parse the correct CAS PDF in CAS Parser & Reconciliation and ensure its holdings
+   quality gate passes.
+2. In Broker Imports & Reconciliation, import one account's broker reports. Prefer
+   the separate annual equity tradebooks for the verified August/September scenario.
+3. Select the CAS statement and corresponding Zerodha account in the CAS expander.
+4. Upload the contract-note workbook, enter the broker trading account (UCC), and
+   confirm that the selected CAS and broker reports belong to that account.
+5. Click **Check documented settlements**. Download comparisons, matched notes,
+   excluded derivatives and later notes from the displayed results.
+
+This separate comparison uses only explicit cash settlement dates. The original
+same-date comparator remains unchanged. Account mismatch, invalid or duplicate note
+rows, missing coverage, failed CAS quality, negative/duplicate snapshots and
+quantity/identity conflicts block the check. MF trades in the covered window require
+separate settlement evidence. Results are recomputed on click and do not persist
+when selections change. Notes must cover every accepted equity trade from the
+first supplied note date through the broker holdings date, including the CAS date.
+Earlier unsettled positions and actual depository delivery are not independently
+verified by this arithmetic.
+
+The actual MYR879 August CAS and September broker snapshot reconcile all 64 ISINs.
+The contract workbook has 196 equity rows and eight excluded derivative rows;
+notes later than the holdings date remain a separate reference. Price differences,
+charges, derivatives, missing historical identifiers and full cashflow history
+remain separate unresolved monetary checks. **Quantity agreement never unlocks XIRR.**
+
+Python 3.14.7 integration and full Streamlit screen tests passed, including actual
+64/64 comparison, CSV rendering, changed-account result clearing, and negative
+account/coverage/schema/quality cases. All 82 pre-existing definitions are unchanged.

@@ -1,5 +1,5 @@
 # NSDL CAS Portfolio Intelligence & Advisory System
-# Requirements version: 1.1.2
+# Requirements version: 1.1.3
 # Target runtime: Python 3.14
 # Build date: 2026-09-14
 #
@@ -12,3 +12,4 @@ plotly==7.0.0
 PyMuPDF==1.28.2
 requests==2.32.5
 python-dateutil==2.9.0.post0
+openpyxl==3.1.5
