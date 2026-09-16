@@ -27,6 +27,67 @@ jobs:
         run: python -m py_compile app.py
       - name: Import smoke test
         run: python -c "import streamlit, pandas, numpy, plotly, fitz, openpyxl, requests, dateutil"
+      - name: Monetary/XIRR evidence-gate tests
+        run: |
+          python - <<'PY'
+          import ast
+          from datetime import date
+          from decimal import Decimal
+          from pathlib import Path
+          import pandas as pd
+
+          source = Path("app.py").read_text()
+          tree = ast.parse(source)
+          wanted = {"D", "broker_monetary_readiness", "broker_xirr_cashflows"}
+          nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in wanted]
+          found = {n.name for n in nodes}
+          assert wanted <= found, f"Missing functions: {wanted-found}"
+          ns = {"Any": object, "Decimal": Decimal, "date": date, "pd": pd}
+          exec(compile(ast.Module(body=nodes, type_ignores=[]), "gate-test", "exec"), ns)
+
+          def base():
+              return {
+                  "as_of": date(2026,9,1),
+                  "trades": pd.DataFrame([{"x":1}]),
+                  "ledger": pd.DataFrame([{"x":1}]),
+                  "external_cashflows": pd.DataFrame([{
+                      "posting_date": date(2026,1,1), "candidate_external_cashflow": Decimal("-1000"),
+                      "source_file":"ledger.xlsx","source_sheet":"Sheet1","source_row":2
+                  }]),
+                  "rejected": pd.DataFrame(),
+                  "reconciliation": pd.DataFrame([{"status":"Quantity agrees"}]),
+                  "ledger_checks": pd.DataFrame([{"unlinked_rows":0}]),
+                  "issues": [],
+                  "opening_cash": Decimal("0"),
+                  "closing_cash": Decimal("100"),
+                  "holdings": pd.DataFrame([{"market_value":Decimal("1200")}]),
+              }
+
+          good=base()
+          r=ns["broker_monetary_readiness"](good)
+          assert r["ready"] is True
+          flows=ns["broker_xirr_cashflows"](good)
+          assert flows[-1] == (date(2026,9,1), Decimal("1300"))
+
+          cases = [
+              ("nonzero opening", lambda x: x.update(opening_cash=Decimal("1"))),
+              ("broken ledger", lambda x: x.update(ledger_checks=pd.DataFrame([{"unlinked_rows":1}]))),
+              ("unresolved quantity", lambda x: x.update(reconciliation=pd.DataFrame([{"status":"Unresolved quantity"}]))),
+              ("rejected row", lambda x: x.update(rejected=pd.DataFrame([{"reason":"bad"}]))),
+              ("F&O gap", lambda x: x.update(issues=["Ledger includes F&O activity; derivative trades/positions are not supplied"])),
+              ("corporate action gap", lambda x: x.update(issues=["corporate actions, transfers and missing history remain unverified."])),
+          ]
+          for name, mutate in cases:
+              x=base(); mutate(x)
+              rr=ns["broker_monetary_readiness"](x)
+              assert rr["ready"] is False, name
+              try:
+                  ns["broker_xirr_cashflows"](x)
+                  raise AssertionError(name+" did not block XIRR")
+              except ValueError:
+                  pass
+          print("Monetary/XIRR gate tests passed")
+          PY
       - name: Streamlit headless startup
         run: |
           timeout 30s streamlit run app.py --server.headless true --server.port 8501 > streamlit.log 2>&1 &
