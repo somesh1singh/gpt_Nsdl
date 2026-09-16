@@ -3170,10 +3170,19 @@ def broker_monetary_readiness(result: dict[str, Any]) -> dict[str, Any]:
     gate("Trade/holding quantity completeness", not reconciliation.empty and unresolved_qty == 0,
          f"{unresolved_qty} unresolved reconciliation rows")
     gate("No rejected source rows", rejected.empty, f"{len(rejected)} rejected/duplicate rows")
-    derivative_gap = any("no accepted derivative trade evidence" in x.lower() for x in issues)
+    derivative_gap = any(
+        ("no accepted derivative trade evidence" in x.lower()) or
+        ("f&o activity" in x.lower() and ("not supplied" in x.lower() or "missing" in x.lower()))
+        for x in issues
+    )
     gate("Derivative scope complete", not derivative_gap,
          "F&O ledger activity requires derivative trade/position evidence" if derivative_gap else "no unresolved F&O scope warning")
-    corp_gap = any(("multiple isins" in x.lower() or "candidate requires source confirmation" in x.lower()) for x in issues)
+    corp_gap = any(
+        ("multiple isins" in x.lower()) or
+        ("candidate requires source confirmation" in x.lower()) or
+        (("corporate actions" in x.lower() or "transfers" in x.lower()) and "unverified" in x.lower())
+        for x in issues
+    )
     gate("Corporate actions / transfers resolved", not corp_gap,
          "corporate actions/transfers remain unverified" if corp_gap else "no unresolved corporate-action/transfer warning")
 
