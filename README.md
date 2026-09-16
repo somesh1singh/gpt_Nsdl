@@ -456,4 +456,4 @@ account/coverage/schema/quality cases. All 82 pre-existing definitions are uncha
 - does not infer missing historical consideration, corporate actions, transfers, identifiers, dividend payment dates or derivative cashflows
 - preserves v1.1.3 documented-settlement quantity reconciliation
 
-**Validation status:** implementation committed on the v1.1.4 development branch; not yet a validated release. Python 3.14/Streamlit regression and actual-file monetary tests remain required before merge.
+**Validation status:** software validation passed in GitHub Actions run #9 (35114449570): Python 3.14 setup, dependency installation, syntax compilation, import smoke test, monetary/XIRR evidence-gate tests and Streamlit headless health all passed. This validates the software gates; it does not assert that the user's complete historical portfolio cashflow evidence is available. Actual-portfolio XIRR remains evidence-gated.
