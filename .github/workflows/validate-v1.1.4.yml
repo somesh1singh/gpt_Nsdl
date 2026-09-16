@@ -25,7 +25,7 @@ jobs:
       - name: Syntax compile
         run: python -m py_compile app.py
       - name: Import smoke test
-        run: python -c "import streamlit, pandas, numpy, scipy, plotly, fitz, openpyxl, yfinance"
+        run: python -c "import streamlit, pandas, numpy, plotly, fitz, openpyxl, requests, dateutil"
       - name: Streamlit headless startup
         run: |
           timeout 30s streamlit run app.py --server.headless true --server.port 8501 > streamlit.log 2>&1 &
