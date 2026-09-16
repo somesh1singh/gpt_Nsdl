@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.14
+# APP VERSION: 1.1.15
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.14"
+APP_VERSION = "1.1.15"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -3124,15 +3124,18 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
         if rr["status"] != "Quantity agrees":
             rec_by_symbol.setdefault((str(rr["asset_class"]), str(rr["symbol"]).upper()), []).append(rr)
     for (asset_class, symbol), group in sorted(rec_by_symbol.items()):
-        if asset_class != "EQ" or len(group) < 2:
+        # Broker parser uses "Equity" for cash equities. Corporate-action pairs
+        # may both be historical/not-in-current-holdings, so compare opposite
+        # unresolved quantity legs rather than requiring one current holding row.
+        if asset_class.lower() not in ("eq", "equity") or len(group) < 2:
             continue
-        old_rows = [r for r in group if not r["in_holdings"] and D(r["net_trade_quantity"]) != 0]
-        current_rows = [r for r in group if r["in_holdings"] and D(r["reported_quantity"]) != D(r["net_trade_quantity"])]
-        for old in old_rows:
-            old_qty = abs(D(old["net_trade_quantity"]))
-            for cur in current_rows:
-                needed = D(cur["reported_quantity"]) - D(cur["net_trade_quantity"])
-                if old_qty <= 0 or needed <= 0:
+        source_rows = [r for r in group if D(r["difference"]) < 0]
+        destination_rows = [r for r in group if D(r["difference"]) > 0]
+        for old in source_rows:
+            old_qty = abs(D(old["difference"]))
+            for cur in destination_rows:
+                needed = D(cur["difference"])
+                if old["isin"] == cur["isin"] or old_qty <= 0 or needed <= 0:
                     continue
                 ratio = needed / old_qty
                 common = [Decimal("0.2"), Decimal("0.25"), Decimal("0.5"), Decimal("1"),
