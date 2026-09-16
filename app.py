@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.12
+# APP VERSION: 1.1.13
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.12"
+APP_VERSION = "1.1.13"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -3115,6 +3115,39 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
             "status": "Quantity agrees" if agreed else "Unresolved quantity",
             "exception_class": classification, "required_evidence": next_evidence,
             "basis": "Zero opening assumed; missing holdings treated as zero for comparison only"})
+    # Evidence-safe resolution candidates: detect exact same-symbol old/current
+    # ISIN quantity conversions, but never auto-clear them without source evidence.
+    resolution_candidates = []
+    rec_by_symbol = {}
+    for rr in reconciliation:
+        if rr["status"] != "Quantity agrees":
+            rec_by_symbol.setdefault((str(rr["asset_class"]), str(rr["symbol"]).upper()), []).append(rr)
+    for (asset_class, symbol), group in sorted(rec_by_symbol.items()):
+        if asset_class != "EQ" or len(group) < 2:
+            continue
+        old_rows = [r for r in group if not r["in_holdings"] and D(r["net_trade_quantity"]) != 0]
+        current_rows = [r for r in group if r["in_holdings"] and D(r["reported_quantity"]) != D(r["net_trade_quantity"])]
+        for old in old_rows:
+            old_qty = abs(D(old["net_trade_quantity"]))
+            for cur in current_rows:
+                needed = D(cur["reported_quantity"]) - D(cur["net_trade_quantity"])
+                if old_qty <= 0 or needed <= 0:
+                    continue
+                ratio = needed / old_qty
+                common = [Decimal("0.2"), Decimal("0.25"), Decimal("0.5"), Decimal("1"),
+                          Decimal("2"), Decimal("3"), Decimal("4"), Decimal("5"), Decimal("10")]
+                matched = next((x for x in common if abs(ratio - x) <= Decimal("0.000001")), None)
+                if matched is not None:
+                    resolution_candidates.append({
+                        "asset_class": asset_class, "symbol": symbol, "from_isin": old["isin"],
+                        "to_isin": cur["isin"], "source_quantity": old_qty,
+                        "required_quantity": needed, "candidate_ratio": matched,
+                        "resolution_type": "Same-symbol ISIN conversion candidate",
+                        "status": "EVIDENCE REQUIRED",
+                        "required_evidence": "Dated exchange/depository corporate-action or transfer record",
+                        "basis": "Exact quantity ratio across unresolved old/current ISIN rows; not auto-applied",
+                    })
+
     ledger, external = [], []
     previous = None
     opening = closing = None
@@ -3208,7 +3241,7 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
         "CAS account/date alignment has not been established; broker quantities are not a full CAS reconciliation.",
     ])
     return {"account_ids": sorted(account_ids), "identifier_review": pd.DataFrame(identifier_review), "inventory": pd.DataFrame(inventory), "trades": pd.DataFrame(trades), "holdings": pd.DataFrame(holdings),
-            "reconciliation": pd.DataFrame(reconciliation), "ledger": pd.DataFrame(ledger),
+            "reconciliation": pd.DataFrame(reconciliation), "resolution_candidates": pd.DataFrame(resolution_candidates), "ledger": pd.DataFrame(ledger),
             "ledger_checks": pd.DataFrame(ledger_checks),
             "external_cashflows": pd.DataFrame(external), "dividends": pd.DataFrame(dividends),
             "pnl": tables.get("pnl", pd.DataFrame()), "pnl_debits": tables.get("pnl_debits", pd.DataFrame()),
