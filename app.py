@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.6
+# APP VERSION: 1.1.7
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.7"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -107,7 +107,9 @@ def xirr_diagnostic_workbook(result: dict[str, Any], readiness: dict[str, Any]) 
     trades = frame("trades")
     fo = pd.DataFrame()
     if not trades.empty:
-        searchable = trades.astype(str).agg(" ".join, axis=1)
+        # Coerce every cell explicitly; object columns can retain numeric scalars
+        # and pandas agg(" ".join) then raises "expected str instance, float found".
+        searchable = trades.apply(lambda row: " ".join("" if pd.isna(v) else str(v) for v in row.tolist()), axis=1)
         fo_mask = searchable.str.contains(r"\b(?:FUT|CE|PE|OPT|F&O|NFO)\b", case=False, regex=True, na=False)
         fo = trades[fo_mask].copy()
 
