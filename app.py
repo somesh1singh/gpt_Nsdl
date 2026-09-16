@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.9
+# APP VERSION: 1.1.10
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.10"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -2791,38 +2791,58 @@ def import_zerodha_workbook(content: bytes, filename: str) -> dict[str, Any]:
                     if following:
                         account_ids.add(following[0])
         for raw in broker_report_blocks(sheet_data):
-            found = None
+            header_hits = []
             for index, (_, row) in enumerate(raw.iterrows()):
                 names = [re.sub(r"[^a-z0-9]+", "_", str(v).strip().lower()).strip("_") if pd.notna(v) else "" for v in row]
                 for kind, required in signatures:
                     if required <= set(names):
-                        found = (index, names, kind)
+                        header_hits.append((index, names, kind))
                         break
-                if found:
-                    break
-            if not found:
+            if not header_hits:
                 issues.append(f"{filename} / {sheet}: unsupported sheet; no rows imported")
                 continue
-            index, names, kind = found
-            positions = [i for i, name in enumerate(names) if name]
-            if len({names[i] for i in positions}) != len(positions):
-                raise ValueError(f"{filename} / {sheet}: duplicate column names")
-            frame = raw.iloc[index + 1:, positions].copy()
-            frame.columns = [names[i] for i in positions]
-            frame = frame.dropna(how="all")
-            frame["source_row"] = frame.index + 1
-            frame["source_file"] = filename
-            frame["source_sheet"] = sheet
-            frame["source_sha256"] = digest
-            frame["asset_class"] = "MF" if sheet.strip().lower() == "mutual funds" else "Equity"
-            preamble = " ".join(str(v) for v in raw.iloc[:index].values.ravel() if pd.notna(v))
-            snapshot = re.search(r"as on (\d{4}-\d{2}-\d{2})", preamble, re.I)
-            period = re.search(r"from (\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})", preamble, re.I)
-            frame["report_period_start"] = period[1] if period else None
-            frame["report_period_end"] = period[2] if period else None
-            tables.append({"kind": kind, "data": frame, "as_of": date.fromisoformat(snapshot[1]) if snapshot else None,
-                           "period": (period[1], period[2]) if period else None,
-                           "header_row": int(raw.index[index]) + 1, "columns": list(frame.columns)})
+            # A combined tradebook can repeat its trade header for successive report
+            # periods. Parse every table independently instead of swallowing later
+            # headings/headers as trade rows under the first period.
+            for hit_no, (index, names, kind) in enumerate(header_hits):
+                next_index = header_hits[hit_no + 1][0] if hit_no + 1 < len(header_hits) else len(raw)
+                positions = [i for i, name in enumerate(names) if name]
+                if len({names[i] for i in positions}) != len(positions):
+                    raise ValueError(f"{filename} / {sheet}: duplicate column names")
+                frame = raw.iloc[index + 1:next_index, positions].copy()
+                frame.columns = [names[i] for i in positions]
+                frame = frame.dropna(how="all")
+                # Remove report-title/summary rows between repeated tables. Actual
+                # trades must contain a trade id/date/side; headings must never be
+                # converted into rejected financial evidence.
+                if kind == "trades" and not frame.empty:
+                    valid_shape = (
+                        frame["trade_id"].notna() &
+                        frame["trade_date"].notna() &
+                        frame["trade_type"].astype(str).str.strip().str.lower().isin(["buy", "sell"])
+                    )
+                    frame = frame.loc[valid_shape].copy()
+                if frame.empty:
+                    continue
+                frame["source_row"] = frame.index + 1
+                frame["source_file"] = filename
+                frame["source_sheet"] = sheet
+                frame["source_sha256"] = digest
+                frame["asset_class"] = "MF" if sheet.strip().lower() == "mutual funds" else "Equity"
+                # Resolve the period from the nearest preceding report title, not
+                # blindly from the first title in a multi-period sheet.
+                preceding = raw.iloc[:index]
+                preamble_rows = [" ".join(str(v) for v in row if pd.notna(v)) for row in preceding.itertuples(index=False, name=None)]
+                preamble = " ".join(preamble_rows)
+                snapshot_matches = list(re.finditer(r"as on (\d{4}-\d{2}-\d{2})", preamble, re.I))
+                period_matches = list(re.finditer(r"from (\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})", preamble, re.I))
+                snapshot = snapshot_matches[-1] if snapshot_matches else None
+                period = period_matches[-1] if period_matches else None
+                frame["report_period_start"] = period[1] if period else None
+                frame["report_period_end"] = period[2] if period else None
+                tables.append({"kind": kind, "data": frame, "as_of": date.fromisoformat(snapshot[1]) if snapshot else None,
+                               "period": (period[1], period[2]) if period else None,
+                               "header_row": int(raw.index[index]) + 1, "columns": list(frame.columns)})
     return {"filename": filename, "sha256": digest, "tables": tables, "issues": issues, "account_ids": sorted(account_ids)}
 
 
