@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.10
+# APP VERSION: 1.1.11
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.10"
+APP_VERSION = "1.1.11"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -2939,6 +2939,17 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
     as_of = next(iter(snapshots)) if len(snapshots) == 1 else None
     if as_of is None:
         issues.append("Holdings require one explicit common snapshot date")
+    # Build a conservative symbol->ISIN evidence map from explicit identifiers in
+    # all uploaded broker tables. A missing trade ISIN is auto-resolved only when
+    # the exact symbol maps to one and only one explicit ISIN in the same account.
+    explicit_symbol_isins: dict[str, set[str]] = {}
+    for evidence_kind in ("trades", "holdings", "pnl"):
+        for erow in tables.get(evidence_kind, pd.DataFrame()).to_dict("records"):
+            esymbol = str(erow.get("symbol", "")).strip().upper()
+            eisin = str(erow.get("isin", "")).strip().upper()
+            if esymbol and esymbol not in ("NAN", "NONE") and re.fullmatch(r"IN[A-Z0-9]{10}", eisin):
+                explicit_symbol_isins.setdefault(esymbol, set()).add(eisin)
+
     trades, holdings, rejected = [], [], []
     trade_keys = {}
     conflicting_trade_keys = set()
@@ -2961,8 +2972,16 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
                 row = {**row, "asset_class": "Derivative"}
             else:
                 isin = reported_isin
+                identifier_source = "reported ISIN"
                 if not re.fullmatch(r"IN[A-Z0-9]{10}", isin):
-                    raise ValueError("Invalid ISIN")
+                    candidates = sorted(explicit_symbol_isins.get(symbol, set()))
+                    if len(candidates) == 1:
+                        isin = candidates[0]
+                        identifier_source = "exact-symbol unique explicit ISIN in uploaded account evidence"
+                    elif len(candidates) > 1:
+                        raise ValueError("Ambiguous ISIN: exact symbol maps to multiple explicit ISINs")
+                    else:
+                        raise ValueError("Invalid ISIN")
             side = str(row["trade_type"]).strip().lower()
             qty, price = broker_number(row["quantity"]), broker_number(row["price"])
             when = broker_date(row["trade_date"])
@@ -2994,7 +3013,8 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
                     raise ValueError("Conflicting trade identity")
                 raise ValueError("Duplicate trade identity")
             trade_keys[key] = payload
-            row = {**row, "isin": isin, "trade_date": when, "quantity": qty, "price": price,
+            row = {**row, "isin": isin, "identifier_source": ("derivative symbol" if is_derivative else identifier_source),
+                   "trade_date": when, "quantity": qty, "price": price,
                    "signed_quantity": qty if side == "buy" else -qty, "gross_consideration": qty * price}
             if as_of is None or when > as_of:
                 raise ValueError("Trade cannot be aligned to holdings snapshot")
