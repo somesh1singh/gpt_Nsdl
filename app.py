@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.11
+# APP VERSION: 1.1.12
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.11"
+APP_VERSION = "1.1.12"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -3085,10 +3085,35 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
     reconciliation = []
     for key in sorted(totals.keys() | held.keys()):
         delta = held.get(key, Decimal(0)) - totals.get(key, Decimal(0))
-        reconciliation.append({"asset_class": key[0], "isin": key[1], "symbol": labels[key],
+        agreed = abs(delta) <= Decimal("0.000001")
+        symbol = labels[key]
+        # Classify, but never auto-clear, quantity exceptions. This turns a single
+        # opaque BLOCK count into evidence-driven work queues without inventing
+        # transactions or corporate actions.
+        classification = "Quantity agrees"
+        next_evidence = ""
+        if not agreed:
+            sym = str(symbol).upper()
+            if re.search(r"(?:-RE\d*|\bRE\d*$)", sym):
+                classification = "Rights entitlement candidate"
+                next_evidence = "Rights issue/allotment or lapse evidence"
+            elif key[0] == "MF":
+                classification = "Mutual-fund quantity gap"
+                next_evidence = "MF transaction/CAS unit movement evidence"
+            elif key not in held:
+                classification = "Closed/not-in-snapshot quantity gap"
+                next_evidence = "Exit, transfer, delisting or corporate-action evidence"
+            elif totals.get(key, Decimal(0)) == 0 and held.get(key, Decimal(0)) != 0:
+                classification = "Opening/transfer quantity candidate"
+                next_evidence = "Pre-tradebook opening position or off-market transfer evidence"
+            else:
+                classification = "Trade/holding quantity gap"
+                next_evidence = "Corporate action, transfer or missing trade evidence"
+        reconciliation.append({"asset_class": key[0], "isin": key[1], "symbol": symbol,
             "in_holdings": key in held, "net_trade_quantity": totals.get(key, Decimal(0)),
             "reported_quantity": held.get(key), "difference": delta,
-            "status": "Quantity agrees" if abs(delta) <= Decimal("0.000001") else "Unresolved quantity",
+            "status": "Quantity agrees" if agreed else "Unresolved quantity",
+            "exception_class": classification, "required_evidence": next_evidence,
             "basis": "Zero opening assumed; missing holdings treated as zero for comparison only"})
     ledger, external = [], []
     previous = None
