@@ -444,3 +444,16 @@ remain separate unresolved monetary checks. **Quantity agreement never unlocks X
 Python 3.14.7 integration and full Streamlit screen tests passed, including actual
 64/64 comparison, CSV rendering, changed-account result clearing, and negative
 account/coverage/schema/quality cases. All 82 pre-existing definitions are unchanged.
+
+
+### v1.1.4 — monetary completeness & XIRR readiness (development)
+
+- adds a strict broker monetary-evidence gate rather than unlocking XIRR from quantity agreement
+- audits accepted trades, dated holdings snapshot, ledger evidence, external bank cashflows, zero opening balance, daily ledger continuity, quantity completeness and rejected rows
+- explicitly blocks readiness when derivative scope or corporate-action/transfer evidence remains unresolved
+- exposes auditable bank receipt/payment cashflow candidates with source provenance
+- constructs broker XIRR cashflows only after every evidence gate passes and adds broker closing cash to the dated holdings terminal value
+- does not infer missing historical consideration, corporate actions, transfers, identifiers, dividend payment dates or derivative cashflows
+- preserves v1.1.3 documented-settlement quantity reconciliation
+
+**Validation status:** implementation committed on the v1.1.4 development branch; not yet a validated release. Python 3.14/Streamlit regression and actual-file monetary tests remain required before merge.
