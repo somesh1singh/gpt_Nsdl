@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.3
+# APP VERSION: 1.1.4
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,10 +32,10 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
-BUILD_DATE = "2026-09-14"
+BUILD_DATE = "2026-09-16"
 UPSTREAM_REPO = "https://raw.githubusercontent.com/aditya-jha/nse-historical-membership/main"
 getcontext().prec = 40
 
@@ -3048,6 +3048,74 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
             "opening_cash": opening, "closing_cash": closing, "xirr_ready": False}
 
 
+
+def broker_monetary_readiness(result: dict[str, Any]) -> dict[str, Any]:
+    """Strict evidence gate for broker-derived cashflows; never infer missing history."""
+    trades = result.get("trades", pd.DataFrame())
+    ledger = result.get("ledger", pd.DataFrame())
+    external = result.get("external_cashflows", pd.DataFrame())
+    rejected = result.get("rejected", pd.DataFrame())
+    reconciliation = result.get("reconciliation", pd.DataFrame())
+    issues = [str(x) for x in result.get("issues", [])]
+    gates = []
+
+    def gate(name: str, passed: bool, evidence: str) -> None:
+        gates.append({"gate": name, "status": "PASS" if passed else "BLOCK", "evidence": evidence})
+
+    gate("Single dated holdings snapshot", result.get("as_of") is not None,
+         str(result.get("as_of") or "No unique holdings date"))
+    gate("Accepted trade evidence", not trades.empty, f"{len(trades)} accepted trade rows")
+    gate("Ledger evidence", not ledger.empty, f"{len(ledger)} accepted ledger rows")
+    gate("External investor cashflows", not external.empty, f"{len(external)} bank receipt/payment rows")
+    opening = result.get("opening_cash")
+    gate("Complete cashflow start", opening is not None and D(opening) == 0,
+         f"ledger opening balance={opening}" if opening is not None else "opening balance unavailable")
+    ledger_checks = result.get("ledger_checks", pd.DataFrame())
+    ledger_ok = (not ledger_checks.empty and "unlinked_rows" in ledger_checks.columns and
+                 pd.to_numeric(ledger_checks["unlinked_rows"], errors="coerce").fillna(1).eq(0).all())
+    gate("Ledger continuity", bool(ledger_ok),
+         f"{len(ledger_checks)} daily chains; all must link to ₹0.01" if not ledger_checks.empty else "no daily chain evidence")
+    unresolved_qty = (len(reconciliation) if reconciliation.empty else
+                      int((reconciliation.get("status", pd.Series(dtype=str)) != "Quantity agrees").sum()))
+    gate("Trade/holding quantity completeness", not reconciliation.empty and unresolved_qty == 0,
+         f"{unresolved_qty} unresolved reconciliation rows")
+    gate("No rejected source rows", rejected.empty, f"{len(rejected)} rejected/duplicate rows")
+    derivative_gap = any("F&O activity" in x for x in issues)
+    gate("Derivative scope complete", not derivative_gap,
+         "F&O ledger activity requires derivative trade/position evidence" if derivative_gap else "no unresolved F&O scope warning")
+    corp_gap = any(("corporate actions" in x.lower() or "transfers" in x.lower()) for x in issues)
+    gate("Corporate actions / transfers resolved", not corp_gap,
+         "corporate actions/transfers remain unverified" if corp_gap else "no unresolved corporate-action/transfer warning")
+
+    cashflow_rows = []
+    for row in external.to_dict("records"):
+        when = row.get("posting_date")
+        amount = D(row.get("candidate_external_cashflow"))
+        if when and amount:
+            cashflow_rows.append({
+                "date": when, "cashflow": amount,
+                "source_file": row.get("source_file"), "source_sheet": row.get("source_sheet"),
+                "source_row": row.get("source_row"), "basis": "Broker ledger bank receipt/payment",
+            })
+    readiness = bool(gates) and all(g["status"] == "PASS" for g in gates)
+    return {"ready": readiness, "gates": pd.DataFrame(gates), "cashflows": pd.DataFrame(cashflow_rows)}
+
+
+def broker_xirr_cashflows(result: dict[str, Any]) -> list[tuple[date, Decimal]]:
+    """Build broker XIRR flows only after every monetary-completeness gate passes."""
+    readiness = broker_monetary_readiness(result)
+    if not readiness["ready"]:
+        blocked = readiness["gates"][readiness["gates"]["status"] == "BLOCK"]["gate"].tolist()
+        raise ValueError("Broker XIRR blocked by evidence gates: " + ", ".join(blocked))
+    flows = [(r["date"], D(r["cashflow"])) for r in readiness["cashflows"].to_dict("records")]
+    terminal = sum((D(r.get("market_value")) for r in result.get("holdings", pd.DataFrame()).to_dict("records")), Decimal("0"))
+    terminal_value = terminal + D(result.get("closing_cash"))
+    if terminal_value <= 0 or result.get("as_of") is None:
+        raise ValueError("Broker terminal valuation is unavailable or non-positive")
+    flows.append((result["as_of"], terminal_value))
+    return flows
+
+
 def compare_broker_cas_snapshot(broker: pd.DataFrame, cas: pd.DataFrame,
                                 broker_date: date | None, cas_date: date | None) -> pd.DataFrame:
     """The caller selects one CAS statement and one broker account, never all accounts."""
@@ -3245,7 +3313,37 @@ def render_broker_imports() -> None:
     result = st.session_state.get("broker_result")
     if result is None:
         return
-    st.error("Full XIRR remains blocked: cashflow completeness, corporate actions/transfers and CAS alignment require verification.")
+    readiness = broker_monetary_readiness(result)
+    st.subheader("v1.1.4 Monetary completeness & XIRR readiness")
+    st.dataframe(readiness["gates"], use_container_width=True, hide_index=True)
+    if readiness["ready"]:
+        st.success("All current broker monetary-evidence gates pass. XIRR may be calculated from the gated broker cashflows.")
+        try:
+            xirr_flows = broker_xirr_cashflows(result)
+            actual_xirr = xirr(xirr_flows)
+            terminal_holdings = sum((D(r.get("market_value")) for r in result.get("holdings", pd.DataFrame()).to_dict("records")), Decimal("0"))
+            terminal_cash = D(result.get("closing_cash"))
+            terminal_value = terminal_holdings + terminal_cash
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Actual portfolio XIRR", f"{float(actual_xirr) * 100:.2f}%")
+            c2.metric("Terminal holdings value", fmt_inr(terminal_holdings))
+            c3.metric("Closing cash", fmt_inr(terminal_cash))
+            st.caption(f"Evidence-gated money-weighted return through {result['as_of']}. Terminal portfolio value: {fmt_inr(terminal_value)}.")
+            xirr_audit = pd.DataFrame([{
+                "date": when, "cashflow": amount,
+                "basis": "Terminal holdings + closing cash" if i == len(xirr_flows) - 1 else "External investor cashflow"
+            } for i, (when, amount) in enumerate(xirr_flows)])
+            with st.expander("XIRR evidence report"):
+                st.dataframe(xirr_audit.astype(str), use_container_width=True, hide_index=True)
+                df_download("Download XIRR evidence report", xirr_audit, "actual_portfolio_xirr_evidence.csv", "broker_xirr_evidence_csv")
+        except Exception as exc:
+            st.error(f"XIRR calculation failed after readiness gate: {exc}")
+    else:
+        st.error("Broker XIRR remains blocked. The table above identifies the exact evidence gaps; no missing cashflow is inferred.")
+    if not readiness["cashflows"].empty:
+        with st.expander("Auditable external cashflow candidates"):
+            st.dataframe(readiness["cashflows"].astype(str), use_container_width=True, hide_index=True)
+            df_download("Download monetary cashflow audit", readiness["cashflows"], "broker_monetary_cashflows.csv", "broker_money_csv")
     st.write(f"Holdings snapshot: {result['as_of'] or 'Unresolved'}")
     st.dataframe(result["inventory"], use_container_width=True)
     rec = result["reconciliation"]

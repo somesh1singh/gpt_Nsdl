@@ -1,7 +1,7 @@
 # NSDL CAS Portfolio Intelligence & Advisory System
-# Requirements version: 1.1.3
+# Requirements version: 1.1.4
 # Target runtime: Python 3.14
-# Build date: 2026-09-14
+# Build date: 2026-09-16
 #
 # Versions are pinned to make Streamlit Community Cloud deployments reproducible.
 
