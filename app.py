@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.13
+# APP VERSION: 1.1.14
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.13"
+APP_VERSION = "1.1.14"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -142,6 +142,7 @@ def xirr_diagnostic_workbook(result: dict[str, Any], readiness: dict[str, Any]) 
         "External_Cashflows": external,
         "Ledger_Checks": ledger_checks,
         "Holdings_Reconciliation": rec,
+        "Resolution_Candidates": result.get("resolution_candidates", pd.DataFrame()),
         "XIRR_Cashflows": xirr_rows,
         "XIRR_Result": pd.DataFrame(result_rows),
     }
