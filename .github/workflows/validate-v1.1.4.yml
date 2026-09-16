@@ -68,6 +68,7 @@ jobs:
           assert r["ready"] is True
           flows=ns["broker_xirr_cashflows"](good)
           assert flows[-1] == (date(2026,9,1), Decimal("1300"))
+          assert callable(ns["broker_xirr_cashflows"])
 
           cases = [
               ("nonzero opening", lambda x: x.update(opening_cash=Decimal("1"))),
