@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.5
+# APP VERSION: 1.1.6
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -3370,22 +3370,28 @@ def render_broker_imports() -> None:
     st.title("Broker Imports & Reconciliation")
     st.caption("Zerodha Excel reports · Select files for one account and one holdings date. Files stay in this session.")
     uploads = st.file_uploader("Tradebooks, holdings, ledger, dividends and P&L", type=["xlsx"], accept_multiple_files=True, key="broker_uploads")
-    fingerprint = tuple((f.name, hashlib.sha256(f.getvalue()).hexdigest()) for f in uploads)
-    if st.session_state.get("broker_fingerprint") != fingerprint:
-        st.session_state.pop("broker_result", None)
+    # Streamlit removes uploader widget values when its page is not rendered. Persist
+    # the imported/reconciled result independently so navigation does not erase it.
+    current_fingerprint = tuple((f.name, hashlib.sha256(f.getvalue()).hexdigest()) for f in (uploads or []))
+    if uploads and st.session_state.get("broker_fingerprint") not in (None, current_fingerprint):
+        st.info("A different broker file set is selected. Click Import and reconcile to replace the frozen session dataset.")
     if st.button("Import and reconcile", disabled=not uploads):
-        st.session_state.pop("broker_result", None)
         try:
             books = [import_zerodha_workbook(f.getvalue(), f.name) for f in uploads]
-            st.session_state.broker_result = reconcile_zerodha(books)
-            st.session_state.broker_fingerprint = fingerprint
+            new_result = reconcile_zerodha(books)
+            st.session_state.broker_result = new_result
+            st.session_state.broker_fingerprint = current_fingerprint
+            st.session_state.broker_file_names = [f.name for f in uploads]
         except Exception as exc:
             st.error(f"Import failed: {exc}")
+    elif not uploads and st.session_state.get("broker_result") is not None:
+        names = st.session_state.get("broker_file_names", [])
+        st.success(f"Using frozen broker dataset from this session ({len(names)} files). Return here only to replace it.")
     result = st.session_state.get("broker_result")
     if result is None:
         return
     readiness = broker_monetary_readiness(result)
-    st.subheader("v1.1.4 Monetary completeness & XIRR readiness")
+    st.subheader(f"v{APP_VERSION} Monetary completeness & XIRR readiness")
     st.dataframe(readiness["gates"], use_container_width=True, hide_index=True)
     if readiness["ready"]:
         st.success("All current broker monetary-evidence gates pass. XIRR may be calculated from the gated broker cashflows.")
