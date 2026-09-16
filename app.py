@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.4
+# APP VERSION: 1.1.5
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -86,6 +86,77 @@ def df_download(label: str, df: pd.DataFrame, filename: str, key: str) -> None:
         mime="text/csv",
         key=key,
     )
+
+
+def xirr_diagnostic_workbook(result: dict[str, Any], readiness: dict[str, Any]) -> bytes:
+    """Create a single auditable XLSX pack for resolving broker XIRR blockers."""
+    def frame(name: str) -> pd.DataFrame:
+        value = result.get(name, pd.DataFrame())
+        return value.copy() if isinstance(value, pd.DataFrame) else pd.DataFrame()
+
+    rec = frame("reconciliation")
+    unresolved = rec[rec.get("status", pd.Series(index=rec.index, dtype=str)).astype(str) != "Quantity agrees"].copy() if not rec.empty else rec
+    rejected = frame("rejected")
+    external = readiness.get("cashflows", pd.DataFrame())
+    ledger_checks = frame("ledger_checks")
+
+    issue_rows = pd.DataFrame({"issue": [str(x) for x in result.get("issues", [])]})
+    ca_mask = issue_rows["issue"].str.contains("corporate|bonus|split|merger|demerger|transfer", case=False, na=False) if not issue_rows.empty else pd.Series(dtype=bool)
+    corporate = issue_rows[ca_mask].copy() if not issue_rows.empty else issue_rows
+
+    trades = frame("trades")
+    fo = pd.DataFrame()
+    if not trades.empty:
+        searchable = trades.astype(str).agg(" ".join, axis=1)
+        fo_mask = searchable.str.contains(r"\b(?:FUT|CE|PE|OPT|F&O|NFO)\b", case=False, regex=True, na=False)
+        fo = trades[fo_mask].copy()
+
+    summary = readiness.get("gates", pd.DataFrame()).copy()
+    summary.insert(0, "app_version", APP_VERSION)
+    summary["holdings_as_of"] = str(result.get("as_of") or "")
+    summary["opening_cash"] = str(result.get("opening_cash"))
+    summary["closing_cash"] = str(result.get("closing_cash"))
+    summary["xirr_ready"] = bool(readiness.get("ready"))
+
+    xirr_rows = pd.DataFrame()
+    result_rows = [{"metric": "XIRR ready", "value": bool(readiness.get("ready"))}]
+    if readiness.get("ready"):
+        flows = broker_xirr_cashflows(result)
+        xirr_rows = pd.DataFrame([{"date": d, "cashflow": v} for d, v in flows])
+        try:
+            result_rows.append({"metric": "Actual portfolio XIRR", "value": f"{float(xirr(flows))*100:.6f}%"})
+        except Exception as exc:
+            result_rows.append({"metric": "XIRR calculation error", "value": str(exc)})
+    else:
+        blocked = summary.loc[summary["status"].eq("BLOCK"), "gate"].astype(str).tolist() if not summary.empty else []
+        result_rows.append({"metric": "Blocked gates", "value": " | ".join(blocked)})
+
+    sheets = {
+        "Summary_Gates": summary,
+        "Unresolved_Reconciliation": unresolved,
+        "Rejected_Rows": rejected,
+        "FO_Reconciliation": fo,
+        "Corporate_Actions": corporate,
+        "External_Cashflows": external,
+        "Ledger_Checks": ledger_checks,
+        "Holdings_Reconciliation": rec,
+        "XIRR_Cashflows": xirr_rows,
+        "XIRR_Result": pd.DataFrame(result_rows),
+    }
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            safe = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            if safe.empty:
+                safe = pd.DataFrame({"status": ["No rows"]})
+            safe.to_excel(writer, sheet_name=name[:31], index=False)
+            ws = writer.book[name[:31]]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for col in ws.columns:
+                width = min(max((len(str(c.value)) if c.value is not None else 0) for c in col) + 2, 60)
+                ws.column_dimensions[col[0].column_letter].width = max(width, 12)
+    return output.getvalue()
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -3344,6 +3415,19 @@ def render_broker_imports() -> None:
         with st.expander("Auditable external cashflow candidates"):
             st.dataframe(readiness["cashflows"].astype(str), use_container_width=True, hide_index=True)
             df_download("Download monetary cashflow audit", readiness["cashflows"], "broker_monetary_cashflows.csv", "broker_money_csv")
+    try:
+        diagnostic_bytes = xirr_diagnostic_workbook(result, readiness)
+        st.download_button(
+            "Download XIRR Reconciliation Diagnostic.xlsx",
+            data=diagnostic_bytes,
+            file_name="XIRR_Reconciliation_Diagnostic.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="xirr_reconciliation_diagnostic_xlsx",
+        )
+        st.caption("Diagnostic export includes gate evidence, unresolved reconciliation rows, rejected rows, F&O candidates, corporate-action issues, external cashflows, ledger checks and XIRR evidence.")
+    except Exception as exc:
+        st.warning(f"Diagnostic workbook could not be generated: {exc}")
+
     st.write(f"Holdings snapshot: {result['as_of'] or 'Unresolved'}")
     st.dataframe(result["inventory"], use_container_width=True)
     rec = result["reconciliation"]
