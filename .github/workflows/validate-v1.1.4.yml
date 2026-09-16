@@ -1,6 +1,8 @@
 name: Validate v1.1.4
 
 on:
+  push:
+    branches: [v1.1.4-monetary-reconciliation]
   pull_request:
     branches: [main]
   workflow_dispatch:
