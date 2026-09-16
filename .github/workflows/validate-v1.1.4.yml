@@ -1,4 +1,5 @@
 name: Validate v1.1.4
+# validation trigger: corrected dependency smoke test
 
 on:
   push:
