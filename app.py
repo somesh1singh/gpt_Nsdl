@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.7
+# APP VERSION: 1.1.8
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.1.8"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -3176,6 +3176,35 @@ def broker_monetary_readiness(result: dict[str, Any]) -> dict[str, Any]:
 
 def broker_xirr_cashflows(result: dict[str, Any]) -> list[tuple[date, Decimal]]:
     """Build broker XIRR flows only after every monetary-completeness gate passes."""
+    # Mirror the CAS Parser's Statement summary so the user can verify exactly
+    # which broker statements are frozen in the active reconciliation session.
+    inventory = result.get("inventory", pd.DataFrame()).copy()
+    if not inventory.empty:
+        summary_cols = [c for c in [
+            "file", "sheet", "kind", "rows", "header_row", "as_of", "period", "status"
+        ] if c in inventory.columns]
+        broker_summary = inventory[summary_cols].copy()
+        if "file" in broker_summary.columns:
+            broker_summary.insert(0, "statement_no", range(1, len(broker_summary) + 1))
+        st.subheader("Statement summary")
+        st.caption(
+            "Frozen broker evidence currently used for reconciliation. Verify file, statement type, "
+            "period/as-of date and imported row count before interpreting XIRR readiness."
+        )
+        st.dataframe(broker_summary, use_container_width=True, hide_index=True)
+        df_download(
+            "Download statement summary",
+            broker_summary,
+            "broker_statement_summary.csv",
+            "broker_statement_summary_csv",
+        )
+        file_count = broker_summary["file"].nunique() if "file" in broker_summary.columns else 0
+        imported_rows = int(pd.to_numeric(broker_summary.get("rows", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Frozen source files", file_count)
+        c2.metric("Imported statement sections", len(broker_summary))
+        c3.metric("Imported source rows", imported_rows)
+
     readiness = broker_monetary_readiness(result)
     if not readiness["ready"]:
         blocked = readiness["gates"][readiness["gates"]["status"] == "BLOCK"]["gate"].tolist()
