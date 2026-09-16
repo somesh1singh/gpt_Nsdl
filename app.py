@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.8
+# APP VERSION: 1.1.9
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.1.9"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -2915,13 +2915,26 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
 
     for row in tables.get("trades", pd.DataFrame()).to_dict("records"):
         try:
-            isin = str(row["isin"]).strip().upper()
-            if not re.fullmatch(r"IN[A-Z0-9]{10}", isin):
-                raise ValueError("Invalid ISIN")
+            segment = str(row.get("segment", "")).strip().upper()
+            symbol = str(row.get("symbol", "")).strip().upper()
+            reported_isin = str(row.get("isin", "")).strip().upper()
+            is_derivative = segment in ("FO", "F&O", "NFO")
+            if is_derivative:
+                if not symbol or symbol in ("NAN", "NONE"):
+                    raise ValueError("Derivative trade missing instrument symbol")
+                # Exchange-traded derivatives commonly have no equity ISIN. Preserve an
+                # auditable instrument identity without fabricating an ISIN.
+                isin = "DERIV:" + symbol
+                row = {**row, "asset_class": "Derivative"}
+            else:
+                isin = reported_isin
+                if not re.fullmatch(r"IN[A-Z0-9]{10}", isin):
+                    raise ValueError("Invalid ISIN")
             side = str(row["trade_type"]).strip().lower()
             qty, price = broker_number(row["quantity"]), broker_number(row["price"])
             when = broker_date(row["trade_date"])
-            if str(row["segment"]).strip().upper() != ("MF" if row["asset_class"] == "MF" else "EQ"):
+            expected_segment = "MF" if row["asset_class"] == "MF" else ("FO" if is_derivative else "EQ")
+            if segment not in ((expected_segment,) if expected_segment != "FO" else ("FO", "F&O", "NFO")):
                 raise ValueError("Unsupported trade segment for this sheet")
             if pd.isna(when) or side not in ("buy", "sell") or qty <= 0 or price <= 0:
                 raise ValueError("Invalid trade date, side, quantity or price")
@@ -3091,8 +3104,12 @@ def reconcile_zerodha(workbooks: list[dict[str, Any]]) -> dict[str, Any]:
                 issues.append("Ledger opening plus credits minus debits does not equal closing")
         if opening != 0:
             issues.append("Nonzero ledger opening: earlier cashflow history required")
-    if any("F&O" in str(r.get("cost_center", "")) or "F&O" in str(r.get("particulars", "")) for r in ledger):
-        issues.append("Ledger includes F&O activity; derivative trades/positions are not supplied in these equity/MF tradebooks")
+    ledger_has_fo = any("F&O" in str(r.get("cost_center", "")) or "F&O" in str(r.get("particulars", "")).upper() for r in ledger)
+    accepted_fo = [r for r in trades if str(r.get("asset_class", "")).lower() == "derivative"]
+    if ledger_has_fo and not accepted_fo:
+        issues.append("Ledger includes F&O activity; no accepted derivative trade evidence was supplied")
+    elif ledger_has_fo and accepted_fo:
+        issues.append(f"F&O evidence recognized: {len(accepted_fo)} accepted derivative trade rows; open derivative positions still require separate evidence if any exist at holdings date")
     dividends = []
     for row in tables.get("dividends", pd.DataFrame()).to_dict("records"):
         try:
@@ -3153,10 +3170,19 @@ def broker_monetary_readiness(result: dict[str, Any]) -> dict[str, Any]:
     gate("Trade/holding quantity completeness", not reconciliation.empty and unresolved_qty == 0,
          f"{unresolved_qty} unresolved reconciliation rows")
     gate("No rejected source rows", rejected.empty, f"{len(rejected)} rejected/duplicate rows")
-    derivative_gap = any("F&O activity" in x for x in issues)
+    derivative_gap = any(
+        ("no accepted derivative trade evidence" in x.lower()) or
+        ("f&o activity" in x.lower() and ("not supplied" in x.lower() or "missing" in x.lower()))
+        for x in issues
+    )
     gate("Derivative scope complete", not derivative_gap,
          "F&O ledger activity requires derivative trade/position evidence" if derivative_gap else "no unresolved F&O scope warning")
-    corp_gap = any(("corporate actions" in x.lower() or "transfers" in x.lower()) for x in issues)
+    corp_gap = any(
+        ("multiple isins" in x.lower()) or
+        ("candidate requires source confirmation" in x.lower()) or
+        (("corporate actions" in x.lower() or "transfers" in x.lower()) and "unverified" in x.lower())
+        for x in issues
+    )
     gate("Corporate actions / transfers resolved", not corp_gap,
          "corporate actions/transfers remain unverified" if corp_gap else "no unresolved corporate-action/transfer warning")
 
@@ -3176,35 +3202,6 @@ def broker_monetary_readiness(result: dict[str, Any]) -> dict[str, Any]:
 
 def broker_xirr_cashflows(result: dict[str, Any]) -> list[tuple[date, Decimal]]:
     """Build broker XIRR flows only after every monetary-completeness gate passes."""
-    # Mirror the CAS Parser's Statement summary so the user can verify exactly
-    # which broker statements are frozen in the active reconciliation session.
-    inventory = result.get("inventory", pd.DataFrame()).copy()
-    if not inventory.empty:
-        summary_cols = [c for c in [
-            "file", "sheet", "kind", "rows", "header_row", "as_of", "period", "status"
-        ] if c in inventory.columns]
-        broker_summary = inventory[summary_cols].copy()
-        if "file" in broker_summary.columns:
-            broker_summary.insert(0, "statement_no", range(1, len(broker_summary) + 1))
-        st.subheader("Statement summary")
-        st.caption(
-            "Frozen broker evidence currently used for reconciliation. Verify file, statement type, "
-            "period/as-of date and imported row count before interpreting XIRR readiness."
-        )
-        st.dataframe(broker_summary, use_container_width=True, hide_index=True)
-        df_download(
-            "Download statement summary",
-            broker_summary,
-            "broker_statement_summary.csv",
-            "broker_statement_summary_csv",
-        )
-        file_count = broker_summary["file"].nunique() if "file" in broker_summary.columns else 0
-        imported_rows = int(pd.to_numeric(broker_summary.get("rows", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Frozen source files", file_count)
-        c2.metric("Imported statement sections", len(broker_summary))
-        c3.metric("Imported source rows", imported_rows)
-
     readiness = broker_monetary_readiness(result)
     if not readiness["ready"]:
         blocked = readiness["gates"][readiness["gates"]["status"] == "BLOCK"]["gate"].tolist()
