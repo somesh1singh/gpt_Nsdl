@@ -3318,6 +3318,26 @@ def render_broker_imports() -> None:
     st.dataframe(readiness["gates"], use_container_width=True, hide_index=True)
     if readiness["ready"]:
         st.success("All current broker monetary-evidence gates pass. XIRR may be calculated from the gated broker cashflows.")
+        try:
+            xirr_flows = broker_xirr_cashflows(result)
+            actual_xirr = xirr(xirr_flows)
+            terminal_holdings = sum((D(r.get("market_value")) for r in result.get("holdings", pd.DataFrame()).to_dict("records")), Decimal("0"))
+            terminal_cash = D(result.get("closing_cash"))
+            terminal_value = terminal_holdings + terminal_cash
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Actual portfolio XIRR", f"{float(actual_xirr) * 100:.2f}%")
+            c2.metric("Terminal holdings value", fmt_inr(terminal_holdings))
+            c3.metric("Closing cash", fmt_inr(terminal_cash))
+            st.caption(f"Evidence-gated money-weighted return through {result['as_of']}. Terminal portfolio value: {fmt_inr(terminal_value)}.")
+            xirr_audit = pd.DataFrame([{
+                "date": when, "cashflow": amount,
+                "basis": "Terminal holdings + closing cash" if i == len(xirr_flows) - 1 else "External investor cashflow"
+            } for i, (when, amount) in enumerate(xirr_flows)])
+            with st.expander("XIRR evidence report"):
+                st.dataframe(xirr_audit.astype(str), use_container_width=True, hide_index=True)
+                df_download("Download XIRR evidence report", xirr_audit, "actual_portfolio_xirr_evidence.csv", "broker_xirr_evidence_csv")
+        except Exception as exc:
+            st.error(f"XIRR calculation failed after readiness gate: {exc}")
     else:
         st.error("Broker XIRR remains blocked. The table above identifies the exact evidence gaps; no missing cashflow is inferred.")
     if not readiness["cashflows"].empty:
