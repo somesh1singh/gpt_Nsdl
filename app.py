@@ -1,6 +1,6 @@
 # =============================================================================
 # NSDL CAS Portfolio Intelligence & Advisory System
-# APP VERSION: 1.1.9
+# APP VERSION: 1.1.10
 # BLUEPRINT BASELINE: 1.0
 # TARGET PYTHON: 3.14
 # BUILD DATE: 2026-09-14
@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.10"
 BLUEPRINT_VERSION = "1.0"
 TARGET_PYTHON = "3.14"
 BUILD_DATE = "2026-09-16"
@@ -2759,11 +2759,37 @@ def broker_date(value: Any) -> date:
 
 
 def broker_report_blocks(raw: pd.DataFrame) -> list[pd.DataFrame]:
-    """Combined exports repeat report titles, summaries and tables within a sheet."""
+    """Split combined Zerodha exports at every dated report section.
+
+    Tradebooks as well as P&L exports can contain several financial-year sections
+    in one worksheet. Each section must carry its own stated period.
+    """
     starts = []
+    dated_title = re.compile(
+        r"(?:P&L Statement for|Other Debits and Credits for|Tradebook(?: Statement)?(?: for)?|Trade Book(?: for)?).*?"
+        r"from\s+\d{4}-\d{2}-\d{2}\s+to\s+\d{4}-\d{2}-\d{2}",
+        re.I,
+    )
+    generic_period = re.compile(r"from\s+\d{4}-\d{2}-\d{2}\s+to\s+\d{4}-\d{2}-\d{2}", re.I)
     for index, (_, row) in enumerate(raw.iterrows()):
-        if any(re.search(r"^(?:P&L Statement for|Other Debits and Credits for).*from \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}", str(v).strip()) for v in row if pd.notna(v)):
+        text = " ".join(str(v).strip() for v in row if pd.notna(v))
+        if dated_title.search(text):
             starts.append(index)
+    # Some broker exports omit the word Tradebook from later repeated section
+    # titles. Treat a standalone dated period as a boundary only when a trade
+    # header occurs shortly afterwards.
+    if not starts:
+        for index, (_, row) in enumerate(raw.iterrows()):
+            text = " ".join(str(v).strip() for v in row if pd.notna(v))
+            if not generic_period.search(text):
+                continue
+            lookahead = raw.iloc[index:min(index + 12, len(raw))]
+            if any({"trade_date","trade_type","quantity","price","trade_id"} <= {
+                re.sub(r"[^a-z0-9]+","_",str(v).strip().lower()).strip("_")
+                for v in rr if pd.notna(v)
+            } for rr in lookahead.itertuples(index=False, name=None)):
+                starts.append(index)
+    starts = sorted(set(starts))
     if not starts:
         return [raw]
     return [raw.iloc[start:end] for start, end in zip(starts, starts[1:] + [len(raw)])]
@@ -2810,6 +2836,13 @@ def import_zerodha_workbook(content: bytes, filename: str) -> dict[str, Any]:
             frame = raw.iloc[index + 1:, positions].copy()
             frame.columns = [names[i] for i in positions]
             frame = frame.dropna(how="all")
+            # Repeated headers/titles inside combined exports are metadata, not
+            # rejected financial evidence. Remove them before validation.
+            normalized_header = [names[i] for i in positions]
+            def is_repeated_header(r: pd.Series) -> bool:
+                vals = [re.sub(r"[^a-z0-9]+", "_", str(v).strip().lower()).strip("_") if pd.notna(v) else "" for v in r.tolist()]
+                return sum(a == b and a for a, b in zip(vals, normalized_header)) >= max(3, len(normalized_header) // 2)
+            frame = frame.loc[~frame.apply(is_repeated_header, axis=1)].copy()
             frame["source_row"] = frame.index + 1
             frame["source_file"] = filename
             frame["source_sheet"] = sheet
