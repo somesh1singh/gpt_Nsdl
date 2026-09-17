@@ -1,0 +1,77 @@
+name: Validate historical UCC rerun hotfix
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [v1.1.23-historical-button-ucc-fix]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax compile
+        run: python -m py_compile app.py _app_core_v115.py historical_holdings_bridge.py cas_snapshot_bridge.py corporate_action_chronology.py resolution_ledger.py
+      - name: Planner rerun refresh regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('historical_holdings_bridge.py').read_text()
+          marker = 'def plan_historical_holdings_dates('
+          start = src.index(marker)
+          body = src[start:src.index('def apply_historical_holdings_bridge(', start)]
+          assert 'bootstrap_session_account_id_from_filenames()' in body
+          assert 'module itself may have been imported before broker files were loaded' in body
+          print('planner refresh hook present')
+          PY
+      - name: Filename UCC voting remains strict
+        run: |
+          python - <<'PY'
+          from historical_holdings_bridge import infer_consistent_ucc_from_filenames
+          assert infer_consistent_ucc_from_filenames([
+              'tradebook-MYR879-EQ-2025-26.xlsx',
+              'tradebook-MYR879-MF-2025-26.xlsx',
+              'ledger.xlsx',
+          ]) == 'MYR879'
+          assert infer_consistent_ucc_from_filenames(['tradebook-MYR879-EQ.xlsx']) is None
+          assert infer_consistent_ucc_from_filenames([
+              'tradebook-MYR879-EQ.xlsx', 'tradebook-MYR879-MF.xlsx',
+              'tradebook-ABC123-EQ.xlsx', 'tradebook-ABC123-MF.xlsx'
+          ]) is None
+          print('strict UCC voting preserved')
+          PY
+      - name: Historical header match remains mandatory
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from historical_holdings_bridge import apply_historical_holdings_bridge
+          rec=[{'asset_class':'Equity','symbol':'JNKINDIA','isin':'INE0OAF01028','in_holdings':False,'reported_quantity':None,'difference':Decimal('36'),'status':'Unresolved quantity','exception_class':'Closed/not-in-snapshot quantity gap','basis':'raw'}]
+          trades=[{'asset_class':'Equity','isin':'INE0OAF01028','trade_date':date(2024,8,7),'signed_quantity':Decimal('-36')}]
+          snap=[{'as_of':date(2024,8,6),'filename':'holdings-06.08.2024.xlsx','account_ids':['ABC123'],'holdings':[{'asset_class':'Equity','isin':'INE0OAF01028','quantity_available':Decimal('36')}]}]
+          try:
+              apply_historical_holdings_bridge(rec,trades,snap,date(2026,9,8),current_account_ids=['MYR879'],rejected=[])
+          except ValueError as exc:
+              assert 'Client ID does not match' in str(exc)
+          else:
+              raise AssertionError('mismatched historical Client ID must block')
+          print('historical header protection preserved')
+          PY
+      - name: Execute app module directly
+        run: |
+          python - <<'PY'
+          import app
+          assert app.APP_VERSION == '1.1.22'
+          print('app executes with rerun hotfix')
+          PY
+      - name: Streamlit headless startup
+        run: |
+          timeout 30s streamlit run app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then cat /tmp/streamlit.log; exit "$code"; fi
+          if grep -q "Traceback" /tmp/streamlit.log; then cat /tmp/streamlit.log; exit 1; fi
