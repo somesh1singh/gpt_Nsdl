@@ -1,0 +1,57 @@
+name: Validate v1.1.21
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [v1.1.21-python314-source-hotfix]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax compile
+        run: python -m py_compile app.py _app_core_v115.py resolution_ledger.py corporate_action_chronology.py cas_snapshot_bridge.py
+      - name: Verify generated source mapping contract
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('app.py').read_text(encoding='utf-8')
+          assert 'import linecache' in src
+          assert 'linecache.cache[runtime_filename]' in src
+          assert 'source.splitlines(keepends=True)' in src
+          assert 'APP_VERSION = "1.1.21"' in src
+          print('source mapping contract present')
+          PY
+      - name: Execute app in a real Streamlit test session
+        run: |
+          python - <<'PY'
+          from streamlit.testing.v1 import AppTest
+          at = AppTest.from_file('app.py', default_timeout=60)
+          at.run()
+          if at.exception:
+              messages = [str(x.value) for x in at.exception]
+              raise AssertionError('Streamlit AppTest exceptions: ' + ' | '.join(messages))
+          print('Streamlit AppTest executed app.py without exceptions')
+          PY
+      - name: Direct inspect regression for cached Yahoo function
+        run: |
+          python - <<'PY'
+          import inspect
+          import runpy
+          ns = runpy.run_path('app.py', run_name='__main__')
+          fn = ns.get('fetch_yahoo_history')
+          assert fn is not None
+          # st.cache_data returns a wrapper; inspect its wrapped function when exposed,
+          # otherwise inspect the wrapper itself. Either path must not raise TokenError.
+          target = getattr(fn, '__wrapped__', fn)
+          text = inspect.getsource(target)
+          assert 'Fetch daily adjusted/close data' in text
+          print('inspect.getsource regression passed')
+          PY
