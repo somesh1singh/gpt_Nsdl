@@ -2,11 +2,39 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+import inspect
+import tokenize
 from typing import Any
 
 import pandas as pd
 
 TOL = Decimal("0.000001")
+
+
+# Python 3.14 + Streamlit compatibility for dynamically transformed app source.
+# Streamlit cache key generation normally falls back when inspect.getsource()
+# raises OSError/TypeError, but Python 3.14 can raise tokenize.TokenError when
+# a function was created by exec() from source whose line map differs from the
+# on-disk file. Translate only that narrow failure into OSError so Streamlit can
+# use its documented source-unavailable fallback rather than crashing startup.
+def _install_streamlit_exec_inspect_compat() -> None:
+    current = inspect.getsource
+    if getattr(current, "_gpt_nsdl_tokenerror_compat", False):
+        return
+
+    original_getsource = current
+
+    def safe_getsource(obj: Any) -> str:
+        try:
+            return original_getsource(obj)
+        except tokenize.TokenError as exc:
+            raise OSError("source unavailable for dynamically transformed function") from exc
+
+    safe_getsource._gpt_nsdl_tokenerror_compat = True  # type: ignore[attr-defined]
+    inspect.getsource = safe_getsource
+
+
+_install_streamlit_exec_inspect_compat()
 
 
 def _d(value: Any) -> Decimal:
