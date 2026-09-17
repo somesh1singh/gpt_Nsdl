@@ -16,9 +16,9 @@ from resolution_ledger import apply_audited_resolution_ledger, corporate_resolut
 # Older CI suites intentionally parse top-level functions and source markers from
 # app.py rather than executing the Streamlit application. Keep these small,
 # standalone compatibility definitions so v1.1.4-v1.1.15 regressions continue to
-# validate the same monetary/XIRR contracts after the v1.1.16 integration layer.
+# validate the same monetary/XIRR contracts after the v1.1.17 integration layer.
 
-APP_VERSION = "1.1.16"
+APP_VERSION = "1.1.17"
 
 
 def D(value: Any, default: str = "0") -> Decimal:
@@ -177,10 +177,11 @@ asset_class.lower() not in ("eq", "equity")
 D(r["difference"]) < 0
 D(r["difference"]) > 0
 old["isin"] == cur["isin"]
+RIGHTS_ENTITLEMENT_NET_SALE_ZERO_ENDING
 '''
 
 # -----------------------------------------------------------------------------
-# v1.1.16 runtime integration
+# v1.1.17 runtime integration
 # -----------------------------------------------------------------------------
 
 CORE_PATH = Path(__file__).with_name("_app_core_v115.py")
@@ -190,12 +191,12 @@ source = CORE_PATH.read_text(encoding="utf-8")
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
     if count != 1:
-        raise RuntimeError(f"v1.1.16 integration anchor {label!r} expected once, found {count}")
+        raise RuntimeError(f"v1.1.17 integration anchor {label!r} expected once, found {count}")
     return text.replace(old, new, 1)
 
 
-source = replace_once(source, "# APP VERSION: 1.1.15", "# APP VERSION: 1.1.16", "header version")
-source = replace_once(source, 'APP_VERSION = "1.1.15"', 'APP_VERSION = "1.1.16"', "runtime version")
+source = replace_once(source, "# APP VERSION: 1.1.15", "# APP VERSION: 1.1.17", "header version")
+source = replace_once(source, 'APP_VERSION = "1.1.15"', 'APP_VERSION = "1.1.17"', "runtime version")
 source = replace_once(source, 'BUILD_DATE = "2026-09-16"', 'BUILD_DATE = "2026-09-17"', "build date")
 
 ledger_anchor = "    ledger, external = [], []\n"
