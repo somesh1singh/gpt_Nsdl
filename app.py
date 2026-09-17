@@ -22,9 +22,9 @@ from resolution_ledger import (
 # Older CI suites intentionally parse top-level functions and source markers from
 # app.py rather than executing the Streamlit application. Keep these small,
 # standalone compatibility definitions so historical regressions continue to
-# validate the same monetary/XIRR contracts after the v1.1.20 integration layer.
+# validate the same monetary/XIRR contracts after the v1.1.21 integration layer.
 
-APP_VERSION = "1.1.20"
+APP_VERSION = "1.1.21"
 
 
 def D(value: Any, default: str = "0") -> Decimal:
@@ -165,6 +165,7 @@ APP_VERSION = "1.1.16"
 APP_VERSION = "1.1.17"
 APP_VERSION = "1.1.18"
 APP_VERSION = "1.1.19"
+APP_VERSION = "1.1.20"
 "DERIV:" + symbol
 no accepted derivative trade evidence
 segment in ("FO", "F&O", "NFO")
@@ -196,7 +197,7 @@ CAS_SNAPSHOT_PLUS_POST_SNAPSHOT_BROKER_TRADES
 '''
 
 # -----------------------------------------------------------------------------
-# v1.1.20 runtime integration
+# v1.1.21 runtime integration
 # -----------------------------------------------------------------------------
 
 CORE_PATH = Path(__file__).with_name("_app_core_v115.py")
@@ -206,13 +207,13 @@ source = CORE_PATH.read_text(encoding="utf-8")
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
     if count != 1:
-        raise RuntimeError(f"v1.1.20 integration anchor {label!r} expected once, found {count}")
+        raise RuntimeError(f"v1.1.21 integration anchor {label!r} expected once, found {count}")
     return text.replace(old, new, 1)
 
 
-source = replace_once(source, "# APP VERSION: 1.1.15", "# APP VERSION: 1.1.20", "header version")
-source = replace_once(source, 'APP_VERSION = "1.1.15"', 'APP_VERSION = "1.1.20"', "runtime version")
-source = replace_once(source, 'BUILD_DATE = "2026-09-16"', 'BUILD_DATE = "2026-09-17"', "build date")
+source = replace_once(source, "# APP VERSION: 1.1.15", "# APP VERSION: 1.1.21", "header version")
+source = replace_once(source, 'APP_VERSION = "1.1.15"', 'APP_VERSION = "1.1.21"', "runtime version")
+source = replace_once(source, 'BUILD_DATE = "2026-09-16"', 'BUILD_DATE = "2026-09-18"', "build date")
 
 ledger_anchor = "    ledger, external = [], []\n"
 ledger_integration = '''    ca_symbols = sorted({\n        str(r.get("symbol", "")).strip().upper()\n        for r in reconciliation\n        if str(r.get("asset_class", "")).lower() in ("eq", "equity")\n        and str(r.get("status", "")) != "Quantity agrees"\n        and str(r.get("symbol", "")).strip()\n        and not re.search(r"-RE\\d*$", str(r.get("symbol", "")).strip().upper())\n    })\n    accepted_trade_dates = [\n        r.get("trade_date") for r in trades\n        if str(r.get("asset_class", "")).lower() in ("eq", "equity") and r.get("trade_date") is not None\n    ]\n    corporate_action_evidence = fetch_nse_corporate_actions(\n        ca_symbols, min(accepted_trade_dates) if accepted_trade_dates else None, as_of\n    ) if ca_symbols and as_of is not None else []\n    reconciliation, resolution_candidates, resolution_ledger = apply_audited_resolution_ledger(\n        reconciliation, resolution_candidates, rejected, trades=trades, corporate_actions=corporate_action_evidence\n    )\n    reconciliation, verified_action_ledger = apply_verified_quantity_actions(\n        reconciliation, trades, corporate_action_evidence, rejected=rejected\n    )\n    resolution_ledger.extend(verified_action_ledger)\n\n'''
@@ -231,7 +232,7 @@ corp_replacement = '''    corp_gap, corp_evidence = corporate_resolution_status(
 source = replace_once(source, corp_anchor, corp_replacement, "corporate gate")
 
 bridge_anchor = '''                    st.markdown("#### Reconcile using documented settlements")\n'''
-bridge_ui = '''                    st.markdown("#### Apply dated CAS snapshot bridge")\n                    st.caption("Uses the selected CAS account quantity on its holdings date plus only accepted broker trades after that date. It never creates or changes cashflows.")\n                    bridge_confirmed = st.checkbox(\n                        "I confirm this CAS account is the same Zerodha account represented by the imported broker files",\n                        key="cas_bridge_account_confirm",\n                    )\n                    if st.button("Apply CAS snapshot bridge", disabled=not bridge_confirmed, key="apply_cas_snapshot_bridge"):\n                        try:\n                            bridge_date = statement.get("holdings_as_of")\n                            if bridge_date is None:\n                                raise ValueError("Selected CAS statement has no validated holdings date")\n                            selected_holdings = cas_holdings[cas_holdings["account"] == account]\n                            bridged, bridge_ledger = apply_cas_snapshot_bridge(\n                                result.get("reconciliation", pd.DataFrame()).to_dict("records"),\n                                result.get("trades", pd.DataFrame()).to_dict("records"),\n                                selected_holdings.to_dict("records"),\n                                bridge_date,\n                                result.get("as_of"),\n                                cas_filename=statement.get("filename", "CAS statement"),\n                                cas_account=str(account),\n                                rejected=result.get("rejected", pd.DataFrame()).to_dict("records"),\n                            )\n                            if not bridge_ledger:\n                                st.warning("No unresolved row matched the strict CAS-snapshot bridge rule. Nothing was changed.")\n                            else:\n                                result["reconciliation"] = pd.DataFrame(bridged)\n                                bridge_df = pd.DataFrame(bridge_ledger)\n                                previous_bridge = result.get("cas_bridge_evidence", pd.DataFrame())\n                                result["cas_bridge_evidence"] = pd.concat([previous_bridge, bridge_df], ignore_index=True) if isinstance(previous_bridge, pd.DataFrame) and not previous_bridge.empty else bridge_df\n                                previous_ledger = result.get("resolution_ledger", pd.DataFrame())\n                                result["resolution_ledger"] = pd.concat([previous_ledger, bridge_df], ignore_index=True, sort=False) if isinstance(previous_ledger, pd.DataFrame) and not previous_ledger.empty else bridge_df\n                                st.session_state.broker_result = result\n                                st.success(f"CAS snapshot bridge resolved {len(bridge_df)} reconciliation row(s).")\n                                st.rerun()\n                        except (ValueError, TypeError, KeyError, InvalidOperation) as exc:\n                            st.error(f"CAS snapshot bridge blocked: {exc}")\n\n'''
+bridge_ui = '''                    st.markdown("#### Apply dated CAS snapshot bridge")\n                    st.caption("Uses the selected CAS account quantity on its holdings date plus only accepted broker trades after that date. It never creates or changes cashflows.")\n                    existing_bridge = result.get("cas_bridge_evidence", pd.DataFrame())\n                    bridge_already_applied = isinstance(existing_bridge, pd.DataFrame) and not existing_bridge.empty\n                    if bridge_already_applied:\n                        st.success(f"CAS snapshot bridge already applied successfully: {len(existing_bridge)} reconciliation row(s) resolved. The evidence is preserved below and in the diagnostic workbook.")\n                    bridge_confirmed = st.checkbox(\n                        "I confirm this CAS account is the same Zerodha account represented by the imported broker files",\n                        key="cas_bridge_account_confirm",\n                        disabled=bridge_already_applied,\n                        value=True if bridge_already_applied else False,\n                    )\n                    if st.button("Apply CAS snapshot bridge", disabled=(not bridge_confirmed) or bridge_already_applied, key="apply_cas_snapshot_bridge"):\n                        try:\n                            bridge_date = statement.get("holdings_as_of")\n                            if bridge_date is None:\n                                raise ValueError("Selected CAS statement has no validated holdings date")\n                            selected_holdings = cas_holdings[cas_holdings["account"] == account]\n                            bridged, bridge_ledger = apply_cas_snapshot_bridge(\n                                result.get("reconciliation", pd.DataFrame()).to_dict("records"),\n                                result.get("trades", pd.DataFrame()).to_dict("records"),\n                                selected_holdings.to_dict("records"),\n                                bridge_date,\n                                result.get("as_of"),\n                                cas_filename=statement.get("filename", "CAS statement"),\n                                cas_account=str(account),\n                                rejected=result.get("rejected", pd.DataFrame()).to_dict("records"),\n                            )\n                            if not bridge_ledger:\n                                st.warning("No unresolved row matched the strict CAS-snapshot bridge rule. Nothing was changed.")\n                            else:\n                                result["reconciliation"] = pd.DataFrame(bridged)\n                                bridge_df = pd.DataFrame(bridge_ledger)\n                                previous_bridge = result.get("cas_bridge_evidence", pd.DataFrame())\n                                result["cas_bridge_evidence"] = pd.concat([previous_bridge, bridge_df], ignore_index=True) if isinstance(previous_bridge, pd.DataFrame) and not previous_bridge.empty else bridge_df\n                                previous_ledger = result.get("resolution_ledger", pd.DataFrame())\n                                result["resolution_ledger"] = pd.concat([previous_ledger, bridge_df], ignore_index=True, sort=False) if isinstance(previous_ledger, pd.DataFrame) and not previous_ledger.empty else bridge_df\n                                st.session_state.broker_result = result\n                                st.success(f"CAS snapshot bridge resolved {len(bridge_df)} reconciliation row(s).")\n                                st.rerun()\n                        except (ValueError, TypeError, KeyError, InvalidOperation) as exc:\n                            st.error(f"CAS snapshot bridge blocked: {exc}")\n\n'''
 source = replace_once(source, bridge_anchor, bridge_ui + bridge_anchor, "CAS bridge UI")
 
 ui_anchor = '''    for key, label in [("reconciliation", "Quantity reconciliation"), ("rejected", "Rejected/duplicate row audit"), ("identifier_review", "Missing ISIN evidence review"),\n'''
