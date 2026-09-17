@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [v1.1.20-cas-snapshot-bridge]
+    branches: [v1.1.20-cas-snapshot-bridge, hotfix-python314-streamlit-inspect]
 
 jobs:
   validate:
@@ -18,6 +18,30 @@ jobs:
         run: pip install -r requirements.txt
       - name: Syntax compile
         run: python -m py_compile app.py _app_core_v115.py resolution_ledger.py corporate_action_chronology.py cas_snapshot_bridge.py
+      - name: Python 3.14 inspect TokenError compatibility regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import inspect
+          import tempfile
+          import cas_snapshot_bridge  # installs the narrow TokenError -> OSError shim
+
+          with tempfile.TemporaryDirectory() as td:
+              path = Path(td) / 'dynamic_source.py'
+              valid = 'def dynamic_func():\n    return 1\n'
+              path.write_text(valid, encoding='utf-8')
+              ns = {}
+              exec(compile(valid, str(path), 'exec'), ns)
+              # Replace the on-disk text with an unterminated block so Python 3.14
+              # source tokenization follows the same TokenError path seen in Streamlit Cloud.
+              path.write_text('def dynamic_func():\n    """unterminated\n', encoding='utf-8')
+              try:
+                  inspect.getsource(ns['dynamic_func'])
+              except OSError:
+                  print('TokenError translated to source-unavailable OSError as required')
+              else:
+                  raise AssertionError('Expected source-unavailable OSError')
+          PY
       - name: CAS snapshot current holding regression
         run: |
           python - <<'PY'
@@ -77,6 +101,13 @@ jobs:
           assert 'CAS_Bridge_Evidence' in wrapper
           assert 'I confirm this CAS account is the same Zerodha account' in wrapper
           print('v1.1.20 integration anchors present')
+          PY
+      - name: Execute app module directly
+        run: |
+          python - <<'PY'
+          import app
+          assert app.APP_VERSION == '1.1.20'
+          print('app module executed through dynamic wrapper without decorator crash')
           PY
       - name: Streamlit headless startup
         run: |
