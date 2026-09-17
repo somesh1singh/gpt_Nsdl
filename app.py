@@ -8,6 +8,7 @@ from typing import Any
 
 import pandas as pd
 
+from corporate_action_chronology import apply_verified_quantity_actions
 from resolution_ledger import (
     apply_audited_resolution_ledger,
     corporate_resolution_status,
@@ -20,9 +21,9 @@ from resolution_ledger import (
 # Older CI suites intentionally parse top-level functions and source markers from
 # app.py rather than executing the Streamlit application. Keep these small,
 # standalone compatibility definitions so historical regressions continue to
-# validate the same monetary/XIRR contracts after the v1.1.18 integration layer.
+# validate the same monetary/XIRR contracts after the v1.1.19 integration layer.
 
-APP_VERSION = "1.1.18"
+APP_VERSION = "1.1.19"
 
 
 def D(value: Any, default: str = "0") -> Decimal:
@@ -160,6 +161,7 @@ def xirr_diagnostic_workbook(result: dict[str, Any], readiness: dict[str, Any]) 
 LEGACY_REGRESSION_MARKERS = r'''
 APP_VERSION = "1.1.16"
 APP_VERSION = "1.1.17"
+APP_VERSION = "1.1.18"
 "DERIV:" + symbol
 no accepted derivative trade evidence
 segment in ("FO", "F&O", "NFO")
@@ -186,10 +188,11 @@ D(r["difference"]) > 0
 old["isin"] == cur["isin"]
 RIGHTS_ENTITLEMENT_NET_SALE_ZERO_ENDING
 EXTERNAL_NSE_BONUS_CHRONOLOGY
+EXTERNAL_NSE_BONUS_SPLIT_CHRONOLOGY
 '''
 
 # -----------------------------------------------------------------------------
-# v1.1.18 runtime integration
+# v1.1.19 runtime integration
 # -----------------------------------------------------------------------------
 
 CORE_PATH = Path(__file__).with_name("_app_core_v115.py")
@@ -199,16 +202,16 @@ source = CORE_PATH.read_text(encoding="utf-8")
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
     if count != 1:
-        raise RuntimeError(f"v1.1.18 integration anchor {label!r} expected once, found {count}")
+        raise RuntimeError(f"v1.1.19 integration anchor {label!r} expected once, found {count}")
     return text.replace(old, new, 1)
 
 
-source = replace_once(source, "# APP VERSION: 1.1.15", "# APP VERSION: 1.1.18", "header version")
-source = replace_once(source, 'APP_VERSION = "1.1.15"', 'APP_VERSION = "1.1.18"', "runtime version")
+source = replace_once(source, "# APP VERSION: 1.1.15", "# APP VERSION: 1.1.19", "header version")
+source = replace_once(source, 'APP_VERSION = "1.1.15"', 'APP_VERSION = "1.1.19"', "runtime version")
 source = replace_once(source, 'BUILD_DATE = "2026-09-16"', 'BUILD_DATE = "2026-09-17"', "build date")
 
 ledger_anchor = "    ledger, external = [], []\n"
-ledger_integration = '''    ca_symbols = sorted({\n        str(r.get("symbol", "")).strip().upper()\n        for r in reconciliation\n        if str(r.get("asset_class", "")).lower() in ("eq", "equity")\n        and str(r.get("exception_class", "")) == "Trade/holding quantity gap"\n        and bool(r.get("in_holdings")) and D(r.get("difference")) > 0\n        and str(r.get("symbol", "")).strip()\n    })\n    accepted_trade_dates = [\n        r.get("trade_date") for r in trades\n        if str(r.get("asset_class", "")).lower() in ("eq", "equity") and r.get("trade_date") is not None\n    ]\n    corporate_action_evidence = fetch_nse_corporate_actions(\n        ca_symbols, min(accepted_trade_dates) if accepted_trade_dates else None, as_of\n    ) if ca_symbols and as_of is not None else []\n    reconciliation, resolution_candidates, resolution_ledger = apply_audited_resolution_ledger(\n        reconciliation, resolution_candidates, rejected, trades=trades, corporate_actions=corporate_action_evidence\n    )\n\n'''
+ledger_integration = '''    ca_symbols = sorted({\n        str(r.get("symbol", "")).strip().upper()\n        for r in reconciliation\n        if str(r.get("asset_class", "")).lower() in ("eq", "equity")\n        and str(r.get("status", "")) != "Quantity agrees"\n        and str(r.get("symbol", "")).strip()\n        and not re.search(r"-RE\\d*$", str(r.get("symbol", "")).strip().upper())\n    })\n    accepted_trade_dates = [\n        r.get("trade_date") for r in trades\n        if str(r.get("asset_class", "")).lower() in ("eq", "equity") and r.get("trade_date") is not None\n    ]\n    corporate_action_evidence = fetch_nse_corporate_actions(\n        ca_symbols, min(accepted_trade_dates) if accepted_trade_dates else None, as_of\n    ) if ca_symbols and as_of is not None else []\n    reconciliation, resolution_candidates, resolution_ledger = apply_audited_resolution_ledger(\n        reconciliation, resolution_candidates, rejected, trades=trades, corporate_actions=corporate_action_evidence\n    )\n    reconciliation, verified_action_ledger = apply_verified_quantity_actions(\n        reconciliation, trades, corporate_action_evidence, rejected=rejected\n    )\n    resolution_ledger.extend(verified_action_ledger)\n\n'''
 source = replace_once(source, ledger_anchor, ledger_integration + ledger_anchor, "resolution ledger call")
 
 result_anchor = '            "reconciliation": pd.DataFrame(reconciliation), "resolution_candidates": pd.DataFrame(resolution_candidates), "ledger": pd.DataFrame(ledger),\n'
