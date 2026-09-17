@@ -1,0 +1,126 @@
+name: Validate v1.1.19
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [v1.1.19-split-chronology]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax compile
+        run: python -m py_compile app.py _app_core_v115.py resolution_ledger.py corporate_action_chronology.py
+      - name: Split parser regression
+        run: |
+          python - <<'PY'
+          from decimal import Decimal
+          from corporate_action_chronology import parse_split_factor
+          assert parse_split_factor('Face Value Split (Sub-Division) - From Rs10/- Per Share To Rs 5/- Per Share') == Decimal('2')
+          assert parse_split_factor('Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 2/- Per Share') == Decimal('5')
+          assert parse_split_factor('Dividend - Rs 2 Per Share') is None
+          print('split parser regression passed')
+          PY
+      - name: Bonus plus split chronology regression
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from corporate_action_chronology import apply_verified_quantity_actions, reconstruct_quantity
+
+          trades = [
+              {'asset_class':'Equity','symbol':'TESTCO','trade_date':date(2023,1,1),'signed_quantity':Decimal('100')},
+              {'asset_class':'Equity','symbol':'TESTCO','trade_date':date(2023,3,1),'signed_quantity':Decimal('50')},
+              {'asset_class':'Equity','symbol':'TESTCO','trade_date':date(2023,6,1),'signed_quantity':Decimal('-150')},
+              {'asset_class':'Equity','symbol':'TESTCO','trade_date':date(2023,8,1),'signed_quantity':Decimal('-300')},
+          ]
+          actions = [
+              {'symbol':'TESTCO','action_type':'BONUS','ex_date':date(2023,2,1),'bonus_numerator':Decimal('1'),'bonus_denominator':Decimal('1'),'verification_level':'EXTERNAL_NSE_VERIFIED','subject':'Bonus 1:1','source_url':'https://www.nseindia.com/companies-listing/corporate-filings-actions'},
+              {'symbol':'TESTCO','action_type':'BONUS','ex_date':date(2023,4,1),'bonus_numerator':Decimal('1'),'bonus_denominator':Decimal('2'),'verification_level':'EXTERNAL_NSE_VERIFIED','subject':'Bonus 1:2','source_url':'https://www.nseindia.com/companies-listing/corporate-filings-actions'},
+              {'symbol':'TESTCO','action_type':'SPLIT','ex_date':date(2023,5,1),'verification_level':'EXTERNAL_NSE_VERIFIED','subject':'Face Value Split (Sub-Division) - From Rs10/- Per Share To Rs 5/- Per Share','source_url':'https://www.nseindia.com/companies-listing/corporate-filings-actions'},
+              {'symbol':'TESTCO','action_type':'BONUS','ex_date':date(2023,7,1),'bonus_numerator':Decimal('1'),'bonus_denominator':Decimal('2'),'verification_level':'EXTERNAL_NSE_VERIFIED','subject':'Bonus 1:2','source_url':'https://www.nseindia.com/companies-listing/corporate-filings-actions'},
+          ]
+          rebuilt = reconstruct_quantity('TESTCO', trades, actions)
+          assert rebuilt is not None
+          final_qty, events = rebuilt
+          assert final_qty == Decimal('600'), (final_qty, events)
+          assert [e['type'] for e in events] == ['BONUS','BONUS','SPLIT','BONUS']
+          rec = [{
+              'asset_class':'Equity','symbol':'TESTCO','isin':'INE000A01001','in_holdings':True,
+              'net_trade_quantity':Decimal('-300'),'reported_quantity':Decimal('600'),'difference':Decimal('900'),
+              'status':'Unresolved quantity','exception_class':'Trade/holding quantity gap','basis':'raw'
+          }]
+          out, ledger = apply_verified_quantity_actions(rec, trades, actions, [])
+          assert out[0]['status'] == 'Quantity agrees'
+          assert len(ledger) == 1
+          assert ledger[0]['rule'] == 'EXTERNAL_NSE_BONUS_SPLIT_CHRONOLOGY'
+          print('bonus + split chronology regression passed')
+          PY
+      - name: Closed position corporate action regression
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from corporate_action_chronology import apply_verified_quantity_actions
+          trades = [
+              {'asset_class':'Equity','symbol':'CLOSED','trade_date':date(2024,1,1),'signed_quantity':Decimal('50')},
+              {'asset_class':'Equity','symbol':'CLOSED','trade_date':date(2024,3,1),'signed_quantity':Decimal('-100')},
+          ]
+          actions = [{
+              'symbol':'CLOSED','action_type':'BONUS','ex_date':date(2024,2,1),
+              'bonus_numerator':Decimal('1'),'bonus_denominator':Decimal('1'),
+              'verification_level':'EXTERNAL_NSE_VERIFIED','subject':'Bonus 1:1',
+              'source_url':'https://www.nseindia.com/companies-listing/corporate-filings-actions'
+          }]
+          rec = [{
+              'asset_class':'Equity','symbol':'CLOSED','isin':'INE000A01002','in_holdings':False,
+              'net_trade_quantity':Decimal('-50'),'reported_quantity':None,'difference':Decimal('50'),
+              'status':'Unresolved quantity','exception_class':'Closed/not-in-snapshot quantity gap','basis':'raw'
+          }]
+          out, ledger = apply_verified_quantity_actions(rec, trades, actions, [])
+          assert out[0]['status'] == 'Quantity agrees'
+          assert len(ledger) == 1 and ledger[0]['ending_reported_quantity'] == 0
+          print('closed-position corporate action regression passed')
+          PY
+      - name: Rights and rejected-source safety regression
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from corporate_action_chronology import apply_verified_quantity_actions
+          trades = [{'asset_class':'Equity','symbol':'RIGHTSCO','trade_date':date(2024,1,1),'signed_quantity':Decimal('100')}]
+          rights = [{'symbol':'RIGHTSCO','action_type':'RIGHTS','ex_date':date(2024,2,1),'verification_level':'EXTERNAL_NSE_VERIFIED','subject':'Rights 1:1'}]
+          rec = [{'asset_class':'Equity','symbol':'RIGHTSCO','isin':'INE000A01003','in_holdings':True,'net_trade_quantity':Decimal('100'),'reported_quantity':Decimal('200'),'difference':Decimal('100'),'status':'Unresolved quantity','exception_class':'Trade/holding quantity gap','basis':'raw'}]
+          out, ledger = apply_verified_quantity_actions(rec, trades, rights, [])
+          assert out[0]['status'] == 'Unresolved quantity' and not ledger
+
+          bonus = [{'symbol':'RIGHTSCO','action_type':'BONUS','ex_date':date(2024,2,1),'bonus_numerator':Decimal('1'),'bonus_denominator':Decimal('1'),'verification_level':'EXTERNAL_NSE_VERIFIED','subject':'Bonus 1:1'}]
+          blocked, blocked_ledger = apply_verified_quantity_actions(rec, trades, bonus, [{'symbol':'RIGHTSCO','reason':'Conflicting trade identity'}])
+          assert blocked[0]['status'] == 'Unresolved quantity' and not blocked_ledger
+          print('rights/rejected-source safety regression passed')
+          PY
+      - name: Version and integration regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          wrapper = Path('app.py').read_text()
+          assert 'APP_VERSION = "1.1.19"' in wrapper
+          assert 'apply_verified_quantity_actions' in wrapper
+          assert 'EXTERNAL_NSE_BONUS_SPLIT_CHRONOLOGY' in wrapper
+          assert 'ca_symbols = sorted({' in wrapper
+          assert 'str(r.get("status", "")) != "Quantity agrees"' in wrapper
+          assert 'corporate_action_evidence = fetch_nse_corporate_actions' in wrapper
+          print('v1.1.19 integration anchors present')
+          PY
+      - name: Streamlit headless startup
+        run: |
+          timeout 30s streamlit run app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then cat /tmp/streamlit.log; exit "$code"; fi
+          if grep -q "Traceback" /tmp/streamlit.log; then cat /tmp/streamlit.log; exit 1; fi
