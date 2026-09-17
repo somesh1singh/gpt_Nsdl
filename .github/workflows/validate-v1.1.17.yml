@@ -1,0 +1,96 @@
+name: Validate v1.1.17
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [v1.1.17-rights-entitlement-ledger]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax compile
+        run: python -m py_compile app.py _app_core_v115.py resolution_ledger.py
+      - name: Prior ISIN conversion regression
+        run: |
+          python - <<'PY'
+          from decimal import Decimal
+          from resolution_ledger import apply_audited_resolution_ledger
+          rec = [
+              {"asset_class":"Equity","symbol":"TESTCO","isin":"INE000A01001","difference":Decimal("-24"),"status":"Unresolved quantity","exception_class":"Closed/not-in-snapshot quantity gap","basis":"raw"},
+              {"asset_class":"Equity","symbol":"TESTCO","isin":"INE000A01002","difference":Decimal("48"),"status":"Unresolved quantity","exception_class":"Trade/holding quantity gap","basis":"raw"},
+          ]
+          candidates = [{"symbol":"TESTCO","from_isin":"INE000A01001","to_isin":"INE000A01002","candidate_ratio":Decimal("2"),"status":"EVIDENCE REQUIRED"}]
+          out, cand, ledger = apply_audited_resolution_ledger(rec, candidates, [])
+          assert len(ledger) == 1
+          assert sum(r["status"] != "Quantity agrees" for r in out) == 0
+          assert ledger[0]["rule"] == "UNIQUE_SAME_SYMBOL_ISIN_RATIO"
+          print("prior ISIN conversion regression passed")
+          PY
+      - name: Rights entitlement quantity regression
+        run: |
+          python - <<'PY'
+          from decimal import Decimal
+          from resolution_ledger import apply_audited_resolution_ledger
+
+          rights = [
+              ("AAA-RE", "INE000A01011", "-50", "50"),
+              ("BBB-RE1", "INE000A01012", "-16", "16"),
+              ("CCC-RE", "INE000A01013", "-29", "29"),
+          ]
+          rec = []
+          for symbol, isin, net, diff in rights:
+              rec.append({
+                  "asset_class":"Equity", "symbol":symbol, "isin":isin,
+                  "in_holdings":False, "net_trade_quantity":Decimal(net),
+                  "reported_quantity":None, "difference":Decimal(diff),
+                  "status":"Unresolved quantity", "exception_class":"Rights entitlement candidate",
+                  "required_evidence":"Rights issue/allotment or lapse evidence", "basis":"raw",
+              })
+          rec.append({
+              "asset_class":"Equity", "symbol":"OTHER", "isin":"INE000A01014",
+              "in_holdings":False, "net_trade_quantity":Decimal("-5"),
+              "reported_quantity":None, "difference":Decimal("5"),
+              "status":"Unresolved quantity", "exception_class":"Closed/not-in-snapshot quantity gap",
+              "basis":"raw",
+          })
+          before = sum(r["status"] != "Quantity agrees" for r in rec)
+          out, _, ledger = apply_audited_resolution_ledger(rec, [], [])
+          after = sum(r["status"] != "Quantity agrees" for r in out)
+          assert before == 4 and after == 1, (before, after, out)
+          rights_ledger = [r for r in ledger if r["rule"] == "RIGHTS_ENTITLEMENT_NET_SALE_ZERO_ENDING"]
+          assert len(rights_ledger) == 3, rights_ledger
+          assert all(r["cashflow_effect"] == "None; quantity-only non-cash credit" for r in rights_ledger)
+          assert next(r for r in out if r["symbol"] == "OTHER")["status"] == "Unresolved quantity"
+
+          # Rejected source evidence must block automatic rights resolution.
+          blocked, _, blocked_ledger = apply_audited_resolution_ledger(
+              [rec[0]], [], [{"symbol":"AAA-RE","reason":"Conflicting trade identity"}]
+          )
+          assert blocked[0]["status"] == "Unresolved quantity"
+          assert not blocked_ledger
+          print("rights entitlement quantity regression passed")
+          PY
+      - name: Version and integration regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          wrapper = Path('app.py').read_text()
+          assert 'APP_VERSION = "1.1.17"' in wrapper
+          assert 'RIGHTS_ENTITLEMENT_NET_SALE_ZERO_ENDING' in wrapper
+          assert 'apply_audited_resolution_ledger' in wrapper
+          assert 'Resolution_Ledger' in wrapper
+          print('v1.1.17 integration anchors present')
+          PY
+      - name: Streamlit headless startup
+        run: |
+          timeout 30s streamlit run app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then cat /tmp/streamlit.log; exit "$code"; fi
+          if grep -q "Traceback" /tmp/streamlit.log; then cat /tmp/streamlit.log; exit 1; fi
