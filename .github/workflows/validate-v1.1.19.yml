@@ -114,8 +114,9 @@ jobs:
           assert 'APP_VERSION = "1.1.19"' in wrapper
           assert 'apply_verified_quantity_actions' in wrapper
           assert 'EXTERNAL_NSE_BONUS_SPLIT_CHRONOLOGY' in wrapper
-          assert 'not re.search(r"-RE\\d*$"' in wrapper
+          assert 'ca_symbols = sorted({' in wrapper
           assert 'str(r.get("status", "")) != "Quantity agrees"' in wrapper
+          assert 'corporate_action_evidence = fetch_nse_corporate_actions' in wrapper
           print('v1.1.19 integration anchors present')
           PY
       - name: Streamlit headless startup
