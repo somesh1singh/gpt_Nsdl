@@ -1,0 +1,46 @@
+name: Validate v1.1.22
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [v1.1.22-cas-bridge-ux]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax compile
+        run: python -m py_compile app.py _app_core_v115.py resolution_ledger.py corporate_action_chronology.py cas_snapshot_bridge.py historical_holdings_bridge.py
+      - name: Preserve historical bridge and persistent CAS bridge UX
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          wrapper = Path('app.py').read_text()
+          assert 'APP_VERSION = "1.1.22"' in wrapper
+          assert 'apply_historical_holdings_bridge' in wrapper
+          assert 'Historical Zerodha holdings bridge' in wrapper
+          assert 'HISTORICAL_HOLDINGS_PLUS_POST_SNAPSHOT_TRADES' in wrapper
+          assert 'bridge_already_applied' in wrapper
+          assert 'CAS snapshot bridge already applied successfully' in wrapper
+          assert 'disabled=(not bridge_confirmed) or bridge_already_applied' in wrapper
+          print('historical bridge preserved and CAS bridge UX hardened')
+          PY
+      - name: Execute app module directly
+        run: |
+          python - <<'PY'
+          import app
+          assert app.APP_VERSION == '1.1.22'
+          print('app module executes successfully')
+          PY
+      - name: Streamlit headless startup
+        run: |
+          timeout 30s streamlit run app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then cat /tmp/streamlit.log; exit "$code"; fi
+          if grep -q "Traceback" /tmp/streamlit.log; then cat /tmp/streamlit.log; exit 1; fi
