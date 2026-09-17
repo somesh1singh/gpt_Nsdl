@@ -1,0 +1,109 @@
+name: Validate v1.1.21
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [v1.1.21-historical-holdings-bridge]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax compile
+        run: python -m py_compile app.py _app_core_v115.py resolution_ledger.py corporate_action_chronology.py cas_snapshot_bridge.py historical_holdings_bridge.py
+      - name: Historical evidence planner regression
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from historical_holdings_bridge import plan_historical_holdings_dates
+          rec = [{'asset_class':'Equity','symbol':'CLOSED','isin':'INE000A01001','status':'Unresolved quantity','exception_class':'Closed/not-in-snapshot quantity gap','net_trade_quantity':Decimal('-50')}]
+          trades = [
+              {'asset_class':'Equity','isin':'INE000A01001','trade_date':date(2024,5,10),'signed_quantity':Decimal('-20')},
+              {'asset_class':'Equity','isin':'INE000A01001','trade_date':date(2025,2,1),'signed_quantity':Decimal('-30')},
+          ]
+          plan = plan_historical_holdings_dates(rec, trades)
+          assert len(plan) == 1
+          assert plan[0]['first_accepted_trade_date'] == date(2024,5,10)
+          assert plan[0]['suggested_snapshot_date'] == date(2024,5,9)
+          print('historical evidence planner passed')
+          PY
+      - name: Historical holdings closed-position regression
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from historical_holdings_bridge import apply_historical_holdings_bridge
+          rec = [{'asset_class':'Equity','symbol':'CLOSED','isin':'INE000A01002','in_holdings':False,'reported_quantity':None,'difference':Decimal('50'),'status':'Unresolved quantity','exception_class':'Closed/not-in-snapshot quantity gap','basis':'raw'}]
+          trades = [
+              {'asset_class':'Equity','isin':'INE000A01002','trade_date':date(2024,5,10),'signed_quantity':Decimal('-20')},
+              {'asset_class':'Equity','isin':'INE000A01002','trade_date':date(2025,2,1),'signed_quantity':Decimal('-30')},
+          ]
+          snaps = [{'as_of':date(2024,5,9),'filename':'holdings-2024-05-09.xlsx','account_ids':['AB1234'],'holdings':[{'asset_class':'Equity','isin':'INE000A01002','quantity_available':Decimal('50')}]}]
+          out, ledger = apply_historical_holdings_bridge(rec,trades,snaps,date(2026,9,8),current_account_ids=['AB1234'],rejected=[])
+          assert out[0]['status'] == 'Quantity agrees'
+          assert len(ledger) == 1
+          assert ledger[0]['historical_snapshot_quantity'] == Decimal('50')
+          assert ledger[0]['post_snapshot_net_trade_quantity'] == Decimal('-50')
+          assert ledger[0]['reconstructed_terminal_quantity'] == Decimal('0')
+          assert ledger[0]['cashflow_effect'] == 'None; quantity evidence only'
+          print('closed-position historical bridge passed')
+          PY
+      - name: Historical holdings snapshot selection and safety regressions
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from historical_holdings_bridge import apply_historical_holdings_bridge
+          rec = [{'asset_class':'Equity','symbol':'SAFE','isin':'INE000A01003','in_holdings':False,'reported_quantity':None,'difference':Decimal('40'),'status':'Unresolved quantity','exception_class':'Closed/not-in-snapshot quantity gap','basis':'raw'}]
+          trades = [{'asset_class':'Equity','isin':'INE000A01003','trade_date':date(2025,1,10),'signed_quantity':Decimal('-40')}]
+          snaps = [
+              {'as_of':date(2024,12,31),'filename':'wrong.xlsx','account_ids':['AB1234'],'holdings':[{'asset_class':'Equity','isin':'INE000A01003','quantity_available':Decimal('30')}]},
+              {'as_of':date(2024,6,30),'filename':'exact.xlsx','account_ids':['AB1234'],'holdings':[{'asset_class':'Equity','isin':'INE000A01003','quantity_available':Decimal('40')}]},
+          ]
+          out, ledger = apply_historical_holdings_bridge(rec,trades,snaps,date(2026,9,8),current_account_ids=['AB1234'],rejected=[])
+          assert out[0]['status'] == 'Quantity agrees'
+          assert ledger[0]['source'] == 'exact.xlsx'
+          try:
+              apply_historical_holdings_bridge(rec,trades,[{'as_of':date(2024,6,30),'filename':'other.xlsx','account_ids':['ZZ9999'],'holdings':[{'asset_class':'Equity','isin':'INE000A01003','quantity_available':Decimal('40')}]}],date(2026,9,8),current_account_ids=['AB1234'],rejected=[])
+          except ValueError as exc:
+              assert 'Client ID does not match' in str(exc)
+          else:
+              raise AssertionError('Account mismatch must block')
+          blocked, blocked_ledger = apply_historical_holdings_bridge(rec,trades,snaps,date(2026,9,8),current_account_ids=['AB1234'],rejected=[{'isin':'INE000A01003','symbol':'SAFE'}])
+          assert blocked[0]['status'] == 'Unresolved quantity' and not blocked_ledger
+          print('historical bridge safety regressions passed')
+          PY
+      - name: Version and integration regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          wrapper = Path('app.py').read_text()
+          assert 'APP_VERSION = "1.1.21"' in wrapper
+          assert 'plan_historical_holdings_dates' in wrapper
+          assert 'apply_historical_holdings_bridge' in wrapper
+          assert 'HISTORICAL_HOLDINGS_PLUS_POST_SNAPSHOT_TRADES' in wrapper
+          assert 'Historical_Holdings_Evidence' in wrapper
+          assert 'Historical Zerodha holdings bridge' in wrapper
+          assert '"account_ids": sorted(account_ids)' in wrapper
+          print('v1.1.21 integration anchors present')
+          PY
+      - name: Execute app module directly
+        run: |
+          python - <<'PY'
+          import app
+          assert app.APP_VERSION == '1.1.21'
+          print('app module executes on Python 3.14')
+          PY
+      - name: Streamlit headless startup
+        run: |
+          timeout 30s streamlit run app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then cat /tmp/streamlit.log; exit "$code"; fi
+          if grep -q "Traceback" /tmp/streamlit.log; then cat /tmp/streamlit.log; exit 1; fi
