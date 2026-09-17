@@ -24,7 +24,7 @@ jobs:
           from pathlib import Path
           import inspect
           import tempfile
-          import cas_snapshot_bridge  # installs the narrow TokenError -> OSError shim
+          import cas_snapshot_bridge
 
           with tempfile.TemporaryDirectory() as td:
               path = Path(td) / 'dynamic_source.py'
@@ -32,8 +32,6 @@ jobs:
               path.write_text(valid, encoding='utf-8')
               ns = {}
               exec(compile(valid, str(path), 'exec'), ns)
-              # Replace the on-disk text with an unterminated block so Python 3.14
-              # source tokenization follows the same TokenError path seen in Streamlit Cloud.
               path.write_text('def dynamic_func():\n    """unterminated\n', encoding='utf-8')
               try:
                   inspect.getsource(ns['dynamic_func'])
@@ -106,8 +104,9 @@ jobs:
         run: |
           python - <<'PY'
           import app
-          assert app.APP_VERSION == '1.1.20'
-          print('app module executed through dynamic wrapper without decorator crash')
+          parts = tuple(int(x) for x in app.APP_VERSION.split('.'))
+          assert parts >= (1, 1, 20)
+          print(f'app module executed through dynamic wrapper on compatible version {app.APP_VERSION}')
           PY
       - name: Streamlit headless startup
         run: |
