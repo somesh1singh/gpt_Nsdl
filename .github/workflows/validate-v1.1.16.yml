@@ -1,0 +1,67 @@
+name: Validate v1.1.16
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [v1.1.16-audited-resolution-ledger]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax compile
+        run: python -m py_compile app.py _app_core_v115.py resolution_ledger.py
+      - name: Audited resolution ledger regression
+        run: |
+          python - <<'PY'
+          from decimal import Decimal
+          from resolution_ledger import apply_audited_resolution_ledger
+
+          rec = [
+              {"asset_class":"Equity","symbol":"TESTCO","isin":"INE000A01001","difference":Decimal("-24"),"status":"Unresolved quantity","exception_class":"Closed/not-in-snapshot quantity gap","basis":"raw"},
+              {"asset_class":"Equity","symbol":"TESTCO","isin":"INE000A01002","difference":Decimal("48"),"status":"Unresolved quantity","exception_class":"Trade/holding quantity gap","basis":"raw"},
+          ]
+          candidates = [{
+              "asset_class":"Equity","symbol":"TESTCO","from_isin":"INE000A01001","to_isin":"INE000A01002",
+              "source_quantity":Decimal("24"),"required_quantity":Decimal("48"),"candidate_ratio":Decimal("2"),
+              "status":"EVIDENCE REQUIRED"
+          }]
+          out, cand, ledger = apply_audited_resolution_ledger(rec, candidates, [])
+          assert len(ledger) == 1, ledger
+          assert sum(r["status"] != "Quantity agrees" for r in out) == 0, out
+          assert all(r["difference"] == 0 for r in out), out
+          assert ledger[0]["conversion_ratio"] == Decimal("2")
+          assert cand[0]["status"] == "INTERNALLY RECONCILED"
+
+          # A rejected row for the same symbol must prevent automatic resolution.
+          blocked, _, blocked_ledger = apply_audited_resolution_ledger(
+              rec, candidates, [{"symbol":"TESTCO","reason":"Conflicting trade identity"}]
+          )
+          assert len(blocked_ledger) == 0
+          assert sum(r["status"] != "Quantity agrees" for r in blocked) == 2
+          print("audited resolution ledger regression passed")
+          PY
+      - name: Integration-anchor regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          wrapper = Path('app.py').read_text()
+          core = Path('_app_core_v115.py').read_text()
+          assert 'apply_audited_resolution_ledger' in wrapper
+          assert 'corporate_resolution_status' in wrapper
+          assert 'Resolution_Ledger' in wrapper
+          assert 'APP_VERSION = "1.1.15"' in core
+          print('integration anchors present')
+          PY
+      - name: Streamlit headless startup
+        run: |
+          timeout 30s streamlit run app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then cat /tmp/streamlit.log; exit "$code"; fi
+          if grep -q "Traceback" /tmp/streamlit.log; then cat /tmp/streamlit.log; exit 1; fi
