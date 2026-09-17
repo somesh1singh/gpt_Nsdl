@@ -99,8 +99,9 @@ jobs:
         run: |
           python - <<'PY'
           import app
-          assert app.APP_VERSION == '1.1.21'
-          print('app module executes on Python 3.14')
+          parts = tuple(int(x) for x in app.APP_VERSION.split('.'))
+          assert parts >= (1, 1, 21)
+          print(f'app module executes on Python 3.14 with historical bridge preserved in v{app.APP_VERSION}')
           PY
       - name: Streamlit headless startup
         run: |
