@@ -98,8 +98,8 @@ def bootstrap_session_account_id_from_filenames() -> str | None:
         return None
 
 
-# Runs on each Streamlit script rerun before the broker UI is executed. If the
-# broker session already contains a validated header Client ID, this is a no-op.
+# Initial import-time attempt. In Streamlit this may occur before broker files are
+# loaded, so plan_historical_holdings_dates() repeats the attempt on every rerun.
 bootstrap_session_account_id_from_filenames()
 
 
@@ -115,6 +115,11 @@ def plan_historical_holdings_dates(
     earlier available date. The bridge itself does not rely on the suggestion;
     it validates any uploaded dated snapshot mathematically.
     """
+    # The planner is executed on every Streamlit rerun immediately before the
+    # historical bridge button. Refresh provisional account identity here because
+    # the module itself may have been imported before broker files were loaded.
+    bootstrap_session_account_id_from_filenames()
+
     by_isin: dict[str, list[date]] = {}
     for row in trades:
         if str(row.get("asset_class", "")).lower() not in ("eq", "equity"):
