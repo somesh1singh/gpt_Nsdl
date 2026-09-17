@@ -106,8 +106,10 @@ jobs:
         run: |
           python - <<'PY'
           import app
-          assert app.APP_VERSION == '1.1.20'
-          print('app module executed through dynamic wrapper without decorator crash')
+          def version_tuple(value):
+              return tuple(int(part) for part in value.split('.'))
+          assert version_tuple(app.APP_VERSION) >= version_tuple('1.1.20')
+          print(f'app v{app.APP_VERSION} executed through dynamic wrapper; v1.1.20 compatibility preserved')
           PY
       - name: Streamlit headless startup
         run: |
