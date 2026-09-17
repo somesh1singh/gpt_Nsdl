@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Any
 
 import pandas as pd
 
 TOL = Decimal("0.000001")
+UCC_FILENAME_RE = re.compile(r"(?<![A-Z0-9])([A-Z]{2,4}\d{3,6})(?![A-Z0-9])")
 
 
 def _d(value: Any) -> Decimal:
@@ -32,6 +34,73 @@ def _as_date(value: Any) -> date | None:
         return value
     parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
     return None if pd.isna(parsed) else parsed.date()
+
+
+def infer_consistent_ucc_from_filenames(
+    filenames: list[str] | tuple[str, ...],
+    *,
+    min_votes: int = 2,
+) -> str | None:
+    """Return one repeated broker UCC token from independent filenames.
+
+    This is deliberately only a provisional identity source. The historical
+    holdings bridge still requires the dated Zerodha workbook itself to expose
+    the same Client ID before any quantity row can be resolved.
+    """
+    counts: dict[str, int] = {}
+    for filename in filenames or []:
+        matches = set(UCC_FILENAME_RE.findall(str(filename).upper()))
+        for candidate in matches:
+            counts[candidate] = counts.get(candidate, 0) + 1
+
+    winners = sorted(candidate for candidate, votes in counts.items() if votes >= min_votes)
+    return winners[0] if len(winners) == 1 else None
+
+
+def bootstrap_session_account_id_from_filenames() -> str | None:
+    """Populate missing broker account identity only from repeated filename evidence.
+
+    Streamlit broker imports sometimes omit Client ID from the parsed report
+    headers even though multiple Zerodha exports carry the same UCC in their
+    filenames. When that happens, store the repeated token as a *provisional*
+    account id. Resolution remains blocked unless a dated historical Zerodha
+    holdings workbook contains the exact same embedded Client ID.
+    """
+    try:
+        import streamlit as st
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        if get_script_run_ctx() is None:
+            return None
+        result = st.session_state.get("broker_result")
+        if not isinstance(result, dict) or result.get("account_ids"):
+            return None
+        candidate = infer_consistent_ucc_from_filenames(
+            st.session_state.get("broker_file_names", []) or []
+        )
+        if not candidate:
+            return None
+
+        result["account_ids"] = [candidate]
+        result["account_id_provenance"] = "CONSISTENT_BROKER_FILENAMES_PENDING_HISTORICAL_HEADER_MATCH"
+        issues = list(result.get("issues", []) or [])
+        note = (
+            f"Broker Client ID candidate {candidate} derived from at least two consistent broker filenames; "
+            "historical holdings resolution still requires the same embedded Client ID in the dated Zerodha workbook."
+        )
+        if note not in issues:
+            issues.append(note)
+        result["issues"] = issues
+        st.session_state.broker_result = result
+        return candidate
+    except Exception:
+        # Identity fallback must never prevent the application from starting.
+        return None
+
+
+# Runs on each Streamlit script rerun before the broker UI is executed. If the
+# broker session already contains a validated header Client ID, this is a no-op.
+bootstrap_session_account_id_from_filenames()
 
 
 def plan_historical_holdings_dates(
