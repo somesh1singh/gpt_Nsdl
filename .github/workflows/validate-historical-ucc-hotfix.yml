@@ -1,0 +1,106 @@
+name: Validate historical UCC hotfix
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [v1.1.23-historical-ucc-validation]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax compile
+        run: python -m py_compile app.py _app_core_v115.py historical_holdings_bridge.py cas_snapshot_bridge.py corporate_action_chronology.py resolution_ledger.py
+      - name: Consistent filename UCC regression
+        run: |
+          python - <<'PY'
+          from historical_holdings_bridge import infer_consistent_ucc_from_filenames
+
+          assert infer_consistent_ucc_from_filenames([
+              'tradebook-MYR879-EQ-2025-26.xlsx',
+              'tradebook-MYR879-MF-2025-26.xlsx',
+              'ledger.xlsx',
+          ]) == 'MYR879'
+
+          assert infer_consistent_ucc_from_filenames([
+              'tradebook-MYR879-EQ-2025-26.xlsx',
+              'ledger.xlsx',
+          ]) is None
+
+          assert infer_consistent_ucc_from_filenames([
+              'tradebook-MYR879-EQ.xlsx',
+              'tradebook-MYR879-MF.xlsx',
+              'tradebook-ABC123-EQ.xlsx',
+              'tradebook-ABC123-MF.xlsx',
+          ]) is None
+
+          print('filename UCC voting regressions passed')
+          PY
+      - name: Historical embedded Client ID remains mandatory
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from historical_holdings_bridge import apply_historical_holdings_bridge
+
+          rec = [{
+              'asset_class':'Equity','symbol':'JNKINDIA','isin':'INE0OAF01028',
+              'in_holdings':False,'reported_quantity':None,'difference':Decimal('36'),
+              'status':'Unresolved quantity','exception_class':'Closed/not-in-snapshot quantity gap','basis':'raw'
+          }]
+          trades = [{
+              'asset_class':'Equity','isin':'INE0OAF01028',
+              'trade_date':date(2024,8,7),'signed_quantity':Decimal('-36')
+          }]
+          good = [{
+              'as_of':date(2024,8,6),'filename':'holdings-06.08.2024.xlsx',
+              'account_ids':['MYR879'],
+              'holdings':[{'asset_class':'Equity','isin':'INE0OAF01028','quantity_available':Decimal('36')}]
+          }]
+          out, ledger = apply_historical_holdings_bridge(
+              rec,trades,good,date(2026,9,8),current_account_ids=['MYR879'],rejected=[]
+          )
+          assert out[0]['status'] == 'Quantity agrees'
+          assert len(ledger) == 1
+
+          bad = [{**good[0], 'account_ids':['ABC123']}]
+          try:
+              apply_historical_holdings_bridge(
+                  rec,trades,bad,date(2026,9,8),current_account_ids=['MYR879'],rejected=[]
+              )
+          except ValueError as exc:
+              assert 'Client ID does not match' in str(exc)
+          else:
+              raise AssertionError('Historical header mismatch must block')
+
+          print('historical embedded Client ID protection passed')
+          PY
+      - name: Integration anchors
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('historical_holdings_bridge.py').read_text()
+          assert 'CONSISTENT_BROKER_FILENAMES_PENDING_HISTORICAL_HEADER_MATCH' in src
+          assert 'bootstrap_session_account_id_from_filenames()' in src
+          assert 'min_votes: int = 2' in src
+          print('hotfix integration anchors present')
+          PY
+      - name: Execute app module directly
+        run: |
+          python - <<'PY'
+          import app
+          assert app.APP_VERSION == '1.1.22'
+          print('app executes successfully with historical UCC hotfix')
+          PY
+      - name: Streamlit headless startup
+        run: |
+          timeout 30s streamlit run app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then cat /tmp/streamlit.log; exit "$code"; fi
+          if grep -q "Traceback" /tmp/streamlit.log; then cat /tmp/streamlit.log; exit 1; fi
