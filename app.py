@@ -8,6 +8,7 @@ from typing import Any
 
 import pandas as pd
 
+from cas_snapshot_bridge import apply_cas_snapshot_bridge
 from corporate_action_chronology import apply_verified_quantity_actions
 from resolution_ledger import (
     apply_audited_resolution_ledger,
@@ -21,9 +22,9 @@ from resolution_ledger import (
 # Older CI suites intentionally parse top-level functions and source markers from
 # app.py rather than executing the Streamlit application. Keep these small,
 # standalone compatibility definitions so historical regressions continue to
-# validate the same monetary/XIRR contracts after the v1.1.19 integration layer.
+# validate the same monetary/XIRR contracts after the v1.1.20 integration layer.
 
-APP_VERSION = "1.1.19"
+APP_VERSION = "1.1.20"
 
 
 def D(value: Any, default: str = "0") -> Decimal:
@@ -139,6 +140,7 @@ def xirr_diagnostic_workbook(result: dict[str, Any], readiness: dict[str, Any]) 
         "FO_Reconciliation": fo,
         "Corporate_Actions": corporate,
         "Corporate_Action_Evidence": result.get("corporate_action_evidence", pd.DataFrame()),
+        "CAS_Bridge_Evidence": result.get("cas_bridge_evidence", pd.DataFrame()),
         "External_Cashflows": external,
         "Ledger_Checks": ledger_checks,
         "Holdings_Reconciliation": rec,
@@ -162,6 +164,7 @@ LEGACY_REGRESSION_MARKERS = r'''
 APP_VERSION = "1.1.16"
 APP_VERSION = "1.1.17"
 APP_VERSION = "1.1.18"
+APP_VERSION = "1.1.19"
 "DERIV:" + symbol
 no accepted derivative trade evidence
 segment in ("FO", "F&O", "NFO")
@@ -189,10 +192,11 @@ old["isin"] == cur["isin"]
 RIGHTS_ENTITLEMENT_NET_SALE_ZERO_ENDING
 EXTERNAL_NSE_BONUS_CHRONOLOGY
 EXTERNAL_NSE_BONUS_SPLIT_CHRONOLOGY
+CAS_SNAPSHOT_PLUS_POST_SNAPSHOT_BROKER_TRADES
 '''
 
 # -----------------------------------------------------------------------------
-# v1.1.19 runtime integration
+# v1.1.20 runtime integration
 # -----------------------------------------------------------------------------
 
 CORE_PATH = Path(__file__).with_name("_app_core_v115.py")
@@ -202,12 +206,12 @@ source = CORE_PATH.read_text(encoding="utf-8")
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
     if count != 1:
-        raise RuntimeError(f"v1.1.19 integration anchor {label!r} expected once, found {count}")
+        raise RuntimeError(f"v1.1.20 integration anchor {label!r} expected once, found {count}")
     return text.replace(old, new, 1)
 
 
-source = replace_once(source, "# APP VERSION: 1.1.15", "# APP VERSION: 1.1.19", "header version")
-source = replace_once(source, 'APP_VERSION = "1.1.15"', 'APP_VERSION = "1.1.19"', "runtime version")
+source = replace_once(source, "# APP VERSION: 1.1.15", "# APP VERSION: 1.1.20", "header version")
+source = replace_once(source, 'APP_VERSION = "1.1.15"', 'APP_VERSION = "1.1.20"', "runtime version")
 source = replace_once(source, 'BUILD_DATE = "2026-09-16"', 'BUILD_DATE = "2026-09-17"', "build date")
 
 ledger_anchor = "    ledger, external = [], []\n"
@@ -215,19 +219,23 @@ ledger_integration = '''    ca_symbols = sorted({\n        str(r.get("symbol", "
 source = replace_once(source, ledger_anchor, ledger_integration + ledger_anchor, "resolution ledger call")
 
 result_anchor = '            "reconciliation": pd.DataFrame(reconciliation), "resolution_candidates": pd.DataFrame(resolution_candidates), "ledger": pd.DataFrame(ledger),\n'
-result_replacement = '            "reconciliation": pd.DataFrame(reconciliation), "resolution_candidates": pd.DataFrame(resolution_candidates), "resolution_ledger": pd.DataFrame(resolution_ledger), "corporate_action_evidence": pd.DataFrame(corporate_action_evidence), "ledger": pd.DataFrame(ledger),\n'
+result_replacement = '            "reconciliation": pd.DataFrame(reconciliation), "resolution_candidates": pd.DataFrame(resolution_candidates), "resolution_ledger": pd.DataFrame(resolution_ledger), "corporate_action_evidence": pd.DataFrame(corporate_action_evidence), "cas_bridge_evidence": pd.DataFrame(), "ledger": pd.DataFrame(ledger),\n'
 source = replace_once(source, result_anchor, result_replacement, "result resolution ledger")
 
 sheet_anchor = '        "Resolution_Candidates": result.get("resolution_candidates", pd.DataFrame()),\n        "XIRR_Cashflows": xirr_rows,\n'
-sheet_replacement = '        "Resolution_Candidates": result.get("resolution_candidates", pd.DataFrame()),\n        "Resolution_Ledger": result.get("resolution_ledger", pd.DataFrame()),\n        "Corporate_Action_Evidence": result.get("corporate_action_evidence", pd.DataFrame()),\n        "XIRR_Cashflows": xirr_rows,\n'
+sheet_replacement = '        "Resolution_Candidates": result.get("resolution_candidates", pd.DataFrame()),\n        "Resolution_Ledger": result.get("resolution_ledger", pd.DataFrame()),\n        "Corporate_Action_Evidence": result.get("corporate_action_evidence", pd.DataFrame()),\n        "CAS_Bridge_Evidence": result.get("cas_bridge_evidence", pd.DataFrame()),\n        "XIRR_Cashflows": xirr_rows,\n'
 source = replace_once(source, sheet_anchor, sheet_replacement, "diagnostic corporate-action evidence")
 
 corp_anchor = '''    corp_gap = any(\n        ("multiple isins" in x.lower()) or\n        ("candidate requires source confirmation" in x.lower()) or\n        (("corporate actions" in x.lower() or "transfers" in x.lower()) and "unverified" in x.lower())\n        for x in issues\n    )\n    gate("Corporate actions / transfers resolved", not corp_gap,\n         "corporate actions/transfers remain unverified" if corp_gap else "no unresolved corporate-action/transfer warning")\n'''
 corp_replacement = '''    corp_gap, corp_evidence = corporate_resolution_status(result)\n    gate("Corporate actions / transfers resolved", not corp_gap, corp_evidence)\n'''
 source = replace_once(source, corp_anchor, corp_replacement, "corporate gate")
 
+bridge_anchor = '''                    st.markdown("#### Reconcile using documented settlements")\n'''
+bridge_ui = '''                    st.markdown("#### Apply dated CAS snapshot bridge")\n                    st.caption("Uses the selected CAS account quantity on its holdings date plus only accepted broker trades after that date. It never creates or changes cashflows.")\n                    bridge_confirmed = st.checkbox(\n                        "I confirm this CAS account is the same Zerodha account represented by the imported broker files",\n                        key="cas_bridge_account_confirm",\n                    )\n                    if st.button("Apply CAS snapshot bridge", disabled=not bridge_confirmed, key="apply_cas_snapshot_bridge"):\n                        try:\n                            bridge_date = statement.get("holdings_as_of")\n                            if bridge_date is None:\n                                raise ValueError("Selected CAS statement has no validated holdings date")\n                            selected_holdings = cas_holdings[cas_holdings["account"] == account]\n                            bridged, bridge_ledger = apply_cas_snapshot_bridge(\n                                result.get("reconciliation", pd.DataFrame()).to_dict("records"),\n                                result.get("trades", pd.DataFrame()).to_dict("records"),\n                                selected_holdings.to_dict("records"),\n                                bridge_date,\n                                result.get("as_of"),\n                                cas_filename=statement.get("filename", "CAS statement"),\n                                cas_account=str(account),\n                                rejected=result.get("rejected", pd.DataFrame()).to_dict("records"),\n                            )\n                            if not bridge_ledger:\n                                st.warning("No unresolved row matched the strict CAS-snapshot bridge rule. Nothing was changed.")\n                            else:\n                                result["reconciliation"] = pd.DataFrame(bridged)\n                                bridge_df = pd.DataFrame(bridge_ledger)\n                                previous_bridge = result.get("cas_bridge_evidence", pd.DataFrame())\n                                result["cas_bridge_evidence"] = pd.concat([previous_bridge, bridge_df], ignore_index=True) if isinstance(previous_bridge, pd.DataFrame) and not previous_bridge.empty else bridge_df\n                                previous_ledger = result.get("resolution_ledger", pd.DataFrame())\n                                result["resolution_ledger"] = pd.concat([previous_ledger, bridge_df], ignore_index=True, sort=False) if isinstance(previous_ledger, pd.DataFrame) and not previous_ledger.empty else bridge_df\n                                st.session_state.broker_result = result\n                                st.success(f"CAS snapshot bridge resolved {len(bridge_df)} reconciliation row(s).")\n                                st.rerun()\n                        except (ValueError, TypeError, KeyError, InvalidOperation) as exc:\n                            st.error(f"CAS snapshot bridge blocked: {exc}")\n\n'''
+source = replace_once(source, bridge_anchor, bridge_ui + bridge_anchor, "CAS bridge UI")
+
 ui_anchor = '''    for key, label in [("reconciliation", "Quantity reconciliation"), ("rejected", "Rejected/duplicate row audit"), ("identifier_review", "Missing ISIN evidence review"),\n'''
-ui_replacement = '''    for key, label in [("reconciliation", "Quantity reconciliation"), ("resolution_ledger", "Applied audited resolution ledger"), ("corporate_action_evidence", "Official NSE corporate-action evidence"), ("resolution_candidates", "Resolution candidates"), ("rejected", "Rejected/duplicate row audit"), ("identifier_review", "Missing ISIN evidence review"),\n'''
+ui_replacement = '''    for key, label in [("reconciliation", "Quantity reconciliation"), ("resolution_ledger", "Applied audited resolution ledger"), ("cas_bridge_evidence", "CAS snapshot bridge evidence"), ("corporate_action_evidence", "Official NSE corporate-action evidence"), ("resolution_candidates", "Resolution candidates"), ("rejected", "Rejected/duplicate row audit"), ("identifier_review", "Missing ISIN evidence review"),\n'''
 source = replace_once(source, ui_anchor, ui_replacement, "broker audit UI")
 
 code = compile(source, str(CORE_PATH), "exec")

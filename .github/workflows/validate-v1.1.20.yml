@@ -1,0 +1,85 @@
+name: Validate v1.1.20
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [v1.1.20-cas-snapshot-bridge]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax compile
+        run: python -m py_compile app.py _app_core_v115.py resolution_ledger.py corporate_action_chronology.py cas_snapshot_bridge.py
+      - name: CAS snapshot current holding regression
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from cas_snapshot_bridge import apply_cas_snapshot_bridge
+          rec = [{'asset_class':'MF','symbol':'FUND','isin':'INF000A01001','in_holdings':True,'reported_quantity':Decimal('120'),'difference':Decimal('20'),'status':'Unresolved quantity','exception_class':'Mutual-fund quantity gap','basis':'raw'}]
+          trades = [{'isin':'INF000A01001','trade_date':date(2026,8,10),'signed_quantity':Decimal('20')}]
+          cas = [{'isin':'INF000A01001','quantity_inferred':Decimal('100')}]
+          out, ledger = apply_cas_snapshot_bridge(rec,trades,cas,date(2026,7,31),date(2026,9,8),cas_filename='CAS.pdf',cas_account='ZERODHA',rejected=[])
+          assert out[0]['status'] == 'Quantity agrees'
+          assert len(ledger) == 1
+          assert ledger[0]['cas_snapshot_quantity'] == Decimal('100')
+          assert ledger[0]['post_snapshot_net_trade_quantity'] == Decimal('20')
+          assert ledger[0]['cashflow_effect'] == 'None; quantity evidence only'
+          print('current holding bridge passed')
+          PY
+      - name: CAS snapshot closed position regression
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from cas_snapshot_bridge import apply_cas_snapshot_bridge
+          rec = [{'asset_class':'Equity','symbol':'CLOSED','isin':'INE000A01002','in_holdings':False,'reported_quantity':None,'difference':Decimal('50'),'status':'Unresolved quantity','exception_class':'Closed/not-in-snapshot quantity gap','basis':'raw'}]
+          trades = [{'isin':'INE000A01002','trade_date':date(2026,8,15),'signed_quantity':Decimal('-50')}]
+          cas = [{'isin':'INE000A01002','quantity_inferred':Decimal('50')}]
+          out, ledger = apply_cas_snapshot_bridge(rec,trades,cas,date(2026,7,31),date(2026,9,8),cas_filename='CAS.pdf',cas_account='ZERODHA',rejected=[])
+          assert out[0]['status'] == 'Quantity agrees'
+          assert ledger[0]['reconstructed_terminal_quantity'] == 0
+          print('closed position bridge passed')
+          PY
+      - name: CAS bridge safety regressions
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from decimal import Decimal
+          from cas_snapshot_bridge import apply_cas_snapshot_bridge
+          rec = [{'asset_class':'Equity','symbol':'SAFE','isin':'INE000A01003','in_holdings':True,'reported_quantity':Decimal('100'),'difference':Decimal('20'),'status':'Unresolved quantity','exception_class':'Trade/holding quantity gap','basis':'raw'}]
+          trades = []
+          cas = [{'isin':'INE000A01003','quantity_inferred':Decimal('100')}]
+          future, future_ledger = apply_cas_snapshot_bridge(rec,trades,cas,date(2026,10,1),date(2026,9,8),cas_filename='CAS.pdf',cas_account='ZERODHA',rejected=[])
+          assert future[0]['status'] == 'Unresolved quantity' and not future_ledger
+          rejected, rejected_ledger = apply_cas_snapshot_bridge(rec,trades,cas,date(2026,7,31),date(2026,9,8),cas_filename='CAS.pdf',cas_account='ZERODHA',rejected=[{'isin':'INE000A01003','symbol':'SAFE'}])
+          assert rejected[0]['status'] == 'Unresolved quantity' and not rejected_ledger
+          mismatch, mismatch_ledger = apply_cas_snapshot_bridge(rec,trades,[{'isin':'INE000A01003','quantity_inferred':Decimal('80')}],date(2026,7,31),date(2026,9,8),cas_filename='CAS.pdf',cas_account='ZERODHA',rejected=[])
+          assert mismatch[0]['status'] == 'Unresolved quantity' and not mismatch_ledger
+          print('CAS bridge safety regressions passed')
+          PY
+      - name: Version and integration regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          wrapper = Path('app.py').read_text()
+          assert 'APP_VERSION = "1.1.20"' in wrapper
+          assert 'apply_cas_snapshot_bridge' in wrapper
+          assert 'CAS_SNAPSHOT_PLUS_POST_SNAPSHOT_BROKER_TRADES' in wrapper
+          assert 'CAS_Bridge_Evidence' in wrapper
+          assert 'I confirm this CAS account is the same Zerodha account' in wrapper
+          print('v1.1.20 integration anchors present')
+          PY
+      - name: Streamlit headless startup
+        run: |
+          timeout 30s streamlit run app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then cat /tmp/streamlit.log; exit "$code"; fi
+          if grep -q "Traceback" /tmp/streamlit.log; then cat /tmp/streamlit.log; exit 1; fi
