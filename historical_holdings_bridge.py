@@ -175,6 +175,13 @@ def apply_historical_holdings_bridge(
         return [dict(r) for r in reconciliation], []
 
     current_ids = {str(x).strip().upper() for x in (current_account_ids or []) if str(x).strip()}
+    if not current_ids:
+        raise ValueError(
+            "Historical holdings bridge blocked: current broker Client ID/UCC is unavailable. "
+            "Load broker evidence that exposes the account identity, or provide at least two "
+            "consistent broker filenames so the provisional UCC can be independently matched "
+            "to the embedded Client ID in every historical Zerodha holdings workbook."
+        )
     rejected = rejected or []
     rejected_isins = {
         str(r.get("isin", "")).strip().upper()
