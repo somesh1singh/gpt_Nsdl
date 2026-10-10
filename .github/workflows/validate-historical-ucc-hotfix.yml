@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [v1.1.23-historical-ucc-validation]
+    branches: [main, v1.1.23-historical-ucc-validation]
 
 jobs:
   validate:
@@ -64,6 +64,16 @@ jobs:
               'account_ids':['MYR879'],
               'holdings':[{'asset_class':'Equity','isin':'INE0OAF01028','quantity_available':Decimal('36')}]
           }]
+          # Missing current account identity must fail closed.
+          try:
+              apply_historical_holdings_bridge(
+                  rec,trades,good,date(2026,9,8),current_account_ids=[],rejected=[]
+              )
+          except ValueError as exc:
+              assert 'current broker Client ID/UCC is unavailable' in str(exc)
+          else:
+              raise AssertionError('Missing current account identity must block resolution')
+
           out, ledger = apply_historical_holdings_bridge(
               rec,trades,good,date(2026,9,8),current_account_ids=['MYR879'],rejected=[]
           )
